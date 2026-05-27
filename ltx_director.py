@@ -529,6 +529,13 @@ class LTXDirector(io.ComfyNode):
                     derived_h = tensor.shape[1]
                     derived_w = tensor.shape[2]
 
+                # Loop count: replicate the image along the time/batch dim so the VAE encodes
+                # it as `loop_count` latent frames, all locked to the same image. The model
+                # still generates a smooth transition AFTER the held region into the next keyframe.
+                loop_count = max(1, int(seg.get("loopCount", 1)))
+                if loop_count > 1:
+                    tensor = tensor.repeat(loop_count, 1, 1, 1)
+
                 strength = strengths[idx] if idx < len(strengths) else 1.0
                 guide_data["images"].append(tensor)
                 guide_data["insert_frames"].append(int(seg["start"]))

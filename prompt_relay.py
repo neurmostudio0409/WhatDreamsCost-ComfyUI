@@ -80,7 +80,7 @@ def create_mask_fn(q_token_idx, fallback_tokens_per_frame, latent_frames):
     return mask_fn
 
 
-def build_segments(token_ranges, segment_lengths, epsilon=1e-3, relay_options=None):
+def build_segments(token_ranges, segment_lengths, epsilon=1e-3, relay_options=None, frame_offset=0):
     """Per-segment metadata for the temporal penalty.
 
     relay_options (optional dict) overrides per-stream knobs:
@@ -88,6 +88,11 @@ def build_segments(token_ranges, segment_lengths, epsilon=1e-3, relay_options=No
         audio_epsilon, audio_strength, audio_window_scale
     Audio knobs only affect architectures whose cross-attention takes the scaled
     (non-integer-frame) path — currently LTX audio_attn2.
+
+    frame_offset shifts all segment midpoints forward by this many latent frames.
+    Use it when the diffusion model is sampled over a latent that contains
+    leading reference frames the prompt-relay segments should NOT cover (e.g.
+    Wan Animate's reference latent at the front of the generated sequence).
     """
     # Paper uses constant sigma = 1/ln(1/epsilon) regardless of segment length
     sigma = 1.0 / math.log(1.0 / epsilon) if 0 < epsilon < 1 else 0.1448
@@ -114,7 +119,7 @@ def build_segments(token_ranges, segment_lengths, epsilon=1e-3, relay_options=No
         )
 
     q_token_idx = []
-    frame_cursor = 0
+    frame_cursor = frame_offset
 
     for (tok_start, tok_end), L in zip(token_ranges, segment_lengths):
         if L <= 0:

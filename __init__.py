@@ -6,6 +6,7 @@ from .load_audio_ui import LoadAudioUI
 from .load_video_ui import LoadVideoUI
 from .ltx_director import LTXDirector
 from .ltx_director_guide import LTXDirectorGuide
+from .wan_director import WanDirector, WanS2VDirector, WanVaceDirector, WanAnimateDirector
 from comfy_api.latest import ComfyExtension, io
 from typing_extensions import override
 
@@ -14,12 +15,16 @@ class PromptRelay(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
             LTXDirector,
-            LTXDirectorGuide
+            LTXDirectorGuide,
+            WanDirector,
+            WanS2VDirector,
+            WanVaceDirector,
+            WanAnimateDirector,
         ]
 
 async def comfy_entrypoint() -> PromptRelay:
     return PromptRelay()
-    
+
 NODE_CLASS_MAPPINGS = {
     "LTXKeyframer": LTXKeyframer,
     "MultiImageLoader": MultiImageLoader,
@@ -29,6 +34,10 @@ NODE_CLASS_MAPPINGS = {
     "LoadVideoUI": LoadVideoUI,
     "LTXDirector": LTXDirector,
     "LTXDirectorGuide": LTXDirectorGuide,
+    "WanDirector": WanDirector,
+    "WanS2VDirector": WanS2VDirector,
+    "WanVaceDirector": WanVaceDirector,
+    "WanAnimateDirector": WanAnimateDirector,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -40,6 +49,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadVideoUI": "Load Video UI",
     "LTXDirector": "LTX Director",
     "LTXDirectorGuide": "LTX Director Guide",
+    "WanDirector": "Wan Director",
+    "WanS2VDirector": "Wan S2V Director",
+    "WanVaceDirector": "Wan VACE Director",
+    "WanAnimateDirector": "Wan Animate Director",
 }
 
 WEB_DIRECTORY = "./js"

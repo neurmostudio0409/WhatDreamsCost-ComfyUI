@@ -37,6 +37,14 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.4.0**
+  * **Wan2.2 family support — four new Director nodes**
+    * **Wan Director** — T2V-A14B / I2V-A14B (MoE 14B, two model inputs), FLF-14B, TI2V-5B. Auto-detects Wan2.1 vs Wan2.2 latent format from the model.
+    * **Wan S2V Director** — Wan2.2-S2V (Speech-to-Video). Audio embedding drives lip-sync; place a reference image on the timeline for subject identity. `frame_offset` output chains long clips.
+    * **Wan VACE Director** — Wan2.2-VACE. Control video (pose / depth / sketch) + optional control masks + reference image; outputs `trim_latent` to feed `TrimVideoLatent`.
+    * **Wan Animate Director** — Wan2.2-Animate. Character animation with `pose_video`, `face_video`, `continue_motion` (chunk extending), `character_mask`, `background_video`.
+  * All four reuse the LTX Director timeline UI for **Prompt Relay** segmented prompts. Image segments on the timeline supply the variant-specific reference / start / end images. Reference-prefix latent frames (Animate / VACE) are now correctly skipped when distributing prompt segments.
+
 **v1.3.9**
   * **Fixed recent updates not showing in the manager**
 
@@ -130,6 +138,26 @@ Overhaul of the load audio node. Features a simple interface to easily trim audi
 </details>
 
 # ⚙️ Custom Nodes
+
+
+## Wan Director (Wan2.2 family)
+
+A set of four Director nodes for the Alibaba **Wan2.2** video models, built on the same Prompt Relay timeline editor as LTX Director. All four share the visual timeline UI — prompt segments drive the temporal attention masking, image segments at the start / end of the timeline supply reference / start / end frames where applicable. Audio segments are ignored by the Wan nodes.
+
+**Wan Director** — the main node, supports:
+- **T2V-A14B / I2V-A14B** (Wan2.2 MoE 14B). Connect `model_high` and `model_low` to patch both halves of the MoE pair at once with the same prompt relay configuration.
+- **FLF-14B** (first-last-frame). Place an image at the start of the timeline and another at the end.
+- **TI2V-5B** (the 5B unified text+image to video model, uses the new 4×16×16 VAE).
+
+Variant is auto-detected from the model's latent format and the number of image segments; can be overridden with the `model_variant` dropdown.
+
+**Wan S2V Director** — Wan2.2-S2V (Speech-to-Video). Connect an `AudioEncoder` output for lip-sync; the first timeline image segment becomes the reference subject. Optional `control_video` and `ref_motion` inputs for spatial / motion priors. The `frame_offset` output chains into the next Director call when stitching long clips.
+
+**Wan VACE Director** — Wan2.2-VACE. Drive generation with a `control_video` (pose / depth / sketch / canny etc.) plus optional `control_masks` and `strength`. Returns a `trim_latent` count that should be fed into a `TrimVideoLatent` node after sampling.
+
+**Wan Animate Director** — Wan2.2-Animate (character animation). Inputs include `pose_video`, `face_video`, `reference_image`, `continue_motion` (carry forward the tail frames of a previous chunk), `character_mask`, `background_video`, `clip_vision_output`. Outputs `trim_latent`, `trim_image`, and an updated `video_frame_offset` for chunked long-video generation.
+
+All four Director nodes accept an optional `negative` conditioning (an empty one is built from the connected CLIP if unconnected) and apply the variant-specific concat / VACE / audio conditioning to both positive and negative.
 
 
 ## LTX Director

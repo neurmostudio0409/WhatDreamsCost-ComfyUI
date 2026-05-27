@@ -1343,6 +1343,75 @@ class TimelineEditor {
     this.strengthRow.appendChild(strengthLabel);
     this.strengthRow.appendChild(this.strengthValue);
 
+    // --- Loop Count input (image segments only) ---
+    const loopLabel = document.createElement("span");
+    loopLabel.className = "pr-strength-label";
+    loopLabel.textContent = "Loop:";
+    loopLabel.style.marginLeft = "12px";
+
+    this.loopValue = document.createElement("input");
+    this.loopValue.type = "text";
+    this.loopValue.className = "pr-strength-input";
+    this.loopValue.value = "1";
+    this.loopValue.disabled = true;
+    this.loopValue.style.cursor = "ew-resize";
+    this.loopValue.title = "How many pixel frames the keyframe is held before transitioning (1 = no hold; the model still generates a smooth move to the next keyframe afterwards).";
+
+    let loopDragging = false;
+    let loopStartX = 0;
+    let loopStartVal = 1;
+    let loopMoved = false;
+
+    this.loopValue.addEventListener("mousedown", (e) => {
+      if (this.loopValue.disabled) return;
+      loopStartX = e.clientX;
+      loopStartVal = parseInt(this.loopValue.value, 10) || 1;
+      loopMoved = false;
+
+      const onMove = (mv) => {
+        const dx = mv.clientX - loopStartX;
+        if (Math.abs(dx) > 3) { loopMoved = true; loopDragging = true; }
+        if (loopDragging) {
+          mv.preventDefault();
+          let v = Math.round(loopStartVal + dx * 0.05);
+          v = Math.max(1, Math.min(100, v));
+          this.loopValue.value = String(v);
+          if (this.selectionType === "image" && this.timeline.segments[this.selectedIndex]) {
+            const seg = this.timeline.segments[this.selectedIndex];
+            if (seg.type !== "text") {
+              seg.loopCount = v;
+              this.commitChanges();
+            }
+          }
+        }
+      };
+      const onUp = () => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        if (!loopMoved) { this.loopValue.focus(); this.loopValue.select(); }
+        loopDragging = false;
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+
+    this.loopValue.addEventListener("change", (e) => {
+      let v = parseInt(e.target.value, 10);
+      if (isNaN(v)) v = 1;
+      v = Math.max(1, Math.min(100, v));
+      this.loopValue.value = String(v);
+      if (this.selectionType === "image" && this.timeline.segments[this.selectedIndex]) {
+        const seg = this.timeline.segments[this.selectedIndex];
+        if (seg.type !== "text") {
+          seg.loopCount = v;
+          this.commitChanges();
+        }
+      }
+    });
+
+    this.strengthRow.appendChild(loopLabel);
+    this.strengthRow.appendChild(this.loopValue);
+
 
     this.wrapper.appendChild(toolbar);
     this.wrapper.appendChild(this.viewport);
@@ -1701,6 +1770,7 @@ class TimelineEditor {
       `;
       this.strengthValue.value = "1.00";
       this.strengthValue.disabled = true;
+      if (this.loopValue) { this.loopValue.value = "1"; this.loopValue.disabled = true; }
     } else {
       this.audioInfoArea.style.display = "none";
       this.promptInput.style.display = "block";
@@ -1714,11 +1784,16 @@ class TimelineEditor {
         const strength = isImage ? (seg.guideStrength ?? 1.0) : 1.0;
         this.strengthValue.value = strength.toFixed(2);
         this.strengthValue.disabled = !isImage;
+        if (this.loopValue) {
+          this.loopValue.value = String(isImage ? (seg.loopCount ?? 1) : 1);
+          this.loopValue.disabled = !isImage;
+        }
       } else {
         this.promptInput.value = "";
         this.promptInput.disabled = true;
         this.strengthValue.value = "1.00";
         this.strengthValue.disabled = true;
+        if (this.loopValue) { this.loopValue.value = "1"; this.loopValue.disabled = true; }
       }
     }
 
@@ -3784,7 +3859,13 @@ const APPENDED_WIDGET_DEFAULTS = [
 app.registerExtension({
   name: "LTXDirector",
   async beforeRegisterNodeDef(nodeType, nodeData, app) {
-    if (nodeData.name === "LTXDirector") {
+    if (
+      nodeData.name === "LTXDirector" ||
+      nodeData.name === "WanDirector" ||
+      nodeData.name === "WanS2VDirector" ||
+      nodeData.name === "WanVaceDirector" ||
+      nodeData.name === "WanAnimateDirector"
+    ) {
 
       const onNodeCreated = nodeType.prototype.onNodeCreated;
       nodeType.prototype.onNodeCreated = function () {

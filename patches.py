@@ -131,6 +131,35 @@ def detect_model_type(model):
     )
 
 
+def detect_wan_geometry(model):
+    """Inspect a Wan model and return latent geometry hints.
+
+    Returns dict with:
+        latent_channels: 16 (Wan2.1 / 2.2-14B family) or 48 (Wan2.2 TI2V-5B)
+        spacial_downscale: 8 (Wan2.1 family) or 16 (Wan2.2-5B)
+        temporal_downscale: 4
+        sub_type: model_type from the diffusion model ('t2v', 'i2v', 'vace', 's2v', 'animate', etc.)
+        in_dim: input channel count of the diffusion model
+    """
+    diff_model = model.model.diffusion_model
+    lf = getattr(model.model, "latent_format", None)
+
+    latent_channels = getattr(lf, "latent_channels", 16) if lf is not None else 16
+    spacial_downscale = getattr(lf, "spacial_downscale_ratio", 8) if lf is not None else 8
+    temporal_downscale = getattr(lf, "temporal_downscale_ratio", 4) if lf is not None else 4
+
+    sub_type = getattr(diff_model, "model_type", "t2v")
+    in_dim = getattr(diff_model, "in_dim", 16)
+
+    return {
+        "latent_channels": int(latent_channels),
+        "spacial_downscale": int(spacial_downscale),
+        "temporal_downscale": int(temporal_downscale),
+        "sub_type": str(sub_type),
+        "in_dim": int(in_dim),
+    }
+
+
 def _check_unpatched(model_clone, key):
     if key in getattr(model_clone, "object_patches", {}):
         raise RuntimeError(
