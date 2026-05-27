@@ -377,10 +377,13 @@ class WanDirector(io.ComfyNode):
             # Loop count: replicate along the time dim so the resulting "video" is N frames
             # of the same image. WanImageToVideo / FLF mask the first/last N pixel frames
             # automatically, so the model effectively holds the keyframe for N pixel frames
-            # before generating a smooth transition. Note: Wan's latent compression is 4×
-            # temporally, so loop values translate to ((N-1)//4)+1 latent frames of hold.
+            # before generating a smooth transition. Wan's latent compression is 4× temporally,
+            # so any N within the same 4-frame stride collapses to the same latent hold
+            # (loop=2..4 acts identical to loop=1). Snap up to the next 4n+1 so small loop
+            # values produce a visible hold.
             loop_count = max(1, int(seg.get("loopCount", 1)))
             if loop_count > 1:
+                loop_count = ((loop_count + 2) // 4) * 4 + 1
                 t = t.repeat(loop_count, 1, 1, 1)
             return t
 
