@@ -529,16 +529,23 @@ class LTXDirector(io.ComfyNode):
                     derived_h = tensor.shape[1]
                     derived_w = tensor.shape[2]
 
-                # Per-segment looping is handled in the JS timeline editor: it expands
-                # any image segment with loopCount > 1 into N back-to-back virtual
-                # segments before serializing timeline_data / local_prompts / segment_lengths.
-                # By the time the segment reaches this loop it already represents a single
-                # cycle, so we just emit one keyframe per (expanded) segment.
+                # Loop count → "single keyframe held for length × loopCount pixel frames".
+                # We only replicate to 9 pixel frames here (LTX VAE's smallest non-trivial
+                # window: 1 + 8 = 9 → 2 latent frames). The LTXDirectorGuide node duplicates
+                # the second latent frame at sample time to fill the rest of the hold,
+                # avoiding a giant VAE encode for long holds (e.g. 40 s × 24 fps = 961 frames).
+                loop_count = max(1, int(seg.get("loopCount", 1)))
+                base_length = max(1, int(seg.get("length", 1)))
+                hold_pixel_frames = 1
+                if loop_count > 1:
+                    hold_pixel_frames = base_length * loop_count
+                    tensor = tensor.repeat(9, 1, 1, 1)
 
                 strength = strengths[idx] if idx < len(strengths) else 1.0
                 guide_data["images"].append(tensor)
                 guide_data["insert_frames"].append(int(seg["start"]))
                 guide_data["strengths"].append(float(strength))
+                guide_data.setdefault("hold_pixel_frames", []).append(hold_pixel_frames)
             
             # If no images were loaded from the timeline, create a dummy image at strength 0
             # to prevent artifacts in text-to-video mode.

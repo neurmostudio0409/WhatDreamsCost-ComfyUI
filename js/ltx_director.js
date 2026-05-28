@@ -553,33 +553,15 @@ function getEffectiveLength(seg) {
   return seg.length * loop;
 }
 
-// Flatten a list of segments by replicating each image segment with loopCount > 1
-// into N back-to-back copies. Each copy has loopCount=1 and start shifted by
-// i * length. Used for serialization to the Python side and for building the
-// contiguous prompts/lengths arrays.
-function expandLoopSegments(segs) {
-  const out = [];
-  for (const seg of segs) {
-    const loop = (seg && seg.type !== "text") ? (parseInt(seg.loopCount, 10) || 1) : 1;
-    if (loop > 1) {
-      for (let i = 0; i < loop; i++) {
-        out.push({ ...seg, start: seg.start + i * seg.length, loopCount: 1, id: `${seg.id}__loop_${i}` });
-      }
-    } else {
-      out.push(seg);
-    }
-  }
-  return out;
-}
-
 function parseInitial(jsonStr) {
   let parsed = { segments: [], audioSegments: [] };
   try {
     if (jsonStr) {
       const p = JSON.parse(jsonStr);
-      // Prefer _editorSegments (round-trip with loopCount preserved); fall back
-      // to segments for backward compatibility with workflows saved before the
-      // loop expansion was introduced.
+      // _editorSegments was used by v1.5.0..v1.5.1 to round-trip when segments
+      // were expanded; we no longer expand at serialization so plain `segments`
+      // is enough. Still honoured for backward compat with workflows saved by
+      // those intermediate versions.
       if (Array.isArray(p._editorSegments)) {
         parsed.segments = p._editorSegments;
       } else if (Array.isArray(p.segments)) {
@@ -2971,11 +2953,6 @@ class TimelineEditor {
 
   commitChanges(skipRender = false) {
     let sortedSegments = [...this.timeline.segments].sort((a, b) => a.start - b.start);
-    // Expand image segments with loopCount > 1 into N back-to-back virtual entries
-    // for everything downstream (Python serialization + prompt/length distribution).
-    // The original sortedSegments stays untouched so the editor keeps the user's
-    // single-segment editing view.
-    let expandedSegments = expandLoopSegments(sortedSegments);
 
     let contiguousLengths = [];
     let contiguousPrompts = [];
@@ -2987,8 +2964,11 @@ class TimelineEditor {
     //   segment's length (same as before), but are also clipped at durationFrames.
     // - Segments that start at or past the cutoff are excluded entirely.
     // - Segments that cross the cutoff are trimmed so their end = durationFrames exactly.
+    // For image segments with loopCount > 1 we use the effective length (length * loopCount)
+    // so the prompt-relay schedules the prompt for the whole held span — Python emits a
+    // single keyframe per segment but holds the image for the full effective length.
     let pendingGap = 0;
-    for (let seg of expandedSegments) {
+    for (let seg of sortedSegments) {
       // Skip segments entirely outside the duration.
       if (seg.start >= durationFrames) break;
 
@@ -3002,14 +2982,14 @@ class TimelineEditor {
         }
       }
 
-      // Clip segment end at the duration cutoff.
-      const clippedEnd = Math.min(seg.start + seg.length, durationFrames);
+      const segEffective = getEffectiveLength(seg);
+      const clippedEnd = Math.min(seg.start + segEffective, durationFrames);
       const clippedLength = clippedEnd - seg.start;
 
       contiguousLengths.push(clippedLength + pendingGap);
       contiguousPrompts.push(seg.prompt || "");
       pendingGap = 0;
-      currentCursor = seg.start + seg.length; // advance by the real (unclipped) end for gap detection
+      currentCursor = seg.start + segEffective;
     }
 
     // If segments don't fill to the end of the duration, pad the last segment to reach it.
@@ -3018,14 +2998,17 @@ class TimelineEditor {
       contiguousLengths[contiguousLengths.length - 1] += durationFrames - clampedCursor;
     }
 
-    // timeline_data carries the EXPANDED segments under `segments` so Python receives
-    // the keyframes / prompts already split per cycle, plus the ORIGINAL segments
-    // under `_editorSegments` so a workflow round-trip restores the user's loopCount
-    // editing state. Both lists strip imgObj since it's a runtime-only DOM ref.
+    // timeline_data carries the ORIGINAL segments (with loopCount preserved) — Python
+    // reads `loopCount` and replicates each image into a length * loopCount frame held
+    // chunk before the VAE encode, producing one smooth multi-frame keyframe rather
+    // than N separate keyframes (which caused colour shifts / discontinuity at every
+    // cycle boundary). imgObj is stripped (DOM-only). _editorSegments is kept as an
+    // alias for backward compatibility with workflows saved on v1.5.0..v1.5.1.
     const stripImg = (s) => { const { imgObj, ...rest } = s; return rest; };
+    const savedSegments = sortedSegments.map(stripImg);
     const toSave = {
-      segments: expandedSegments.map(stripImg),
-      _editorSegments: sortedSegments.map(stripImg),
+      segments: savedSegments,
+      _editorSegments: savedSegments,
       audioSegments: (this.timeline.audioSegments || []).map(s => ({ ...s }))
     };
 
@@ -3040,7 +3023,7 @@ class TimelineEditor {
     }
 
     if (this.guideStrengthWidget) {
-      const imgStrengths = expandedSegments
+      const imgStrengths = sortedSegments
         .filter(s => s.type !== "text")
         .map(s => (s.guideStrength !== undefined ? s.guideStrength : 1.0).toFixed(2));
       this.guideStrengthWidget.value = imgStrengths.join(",");

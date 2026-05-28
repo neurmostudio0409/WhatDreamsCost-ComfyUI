@@ -71,12 +71,35 @@ class LTXDirectorGuide(LTXVAddGuide):
         images = guide_data.get("images", [])
         insert_frames = guide_data.get("insert_frames", [])
         strengths = guide_data.get("strengths", [])
+        # Per-image hold length in pixel frames. LTX Director writes this when a
+        # segment has loopCount > 1; the image tensor in `images` is only
+        # replicated to 9 pixel frames (1 + 8) and we expand the encoded latent
+        # below to cover the remaining hold without further VAE encodes.
+        hold_pixel_frames = guide_data.get("hold_pixel_frames", [])
+        time_scale_factor = scale_factors[0]
 
         for idx, img_tensor in enumerate(images):
             f_idx = insert_frames[idx] if idx < len(insert_frames) else 0
             strength = strengths[idx] if idx < len(strengths) else 1.0
+            hold_px = hold_pixel_frames[idx] if idx < len(hold_pixel_frames) else 1
 
             image_1, t = cls.encode(vae, latent_width, latent_height, img_tensor, scale_factors)
+
+            # Expand encoded latent + image_1 to cover the requested hold length.
+            # LTX latent layout: latent[0] encodes pixel frame 0, latent[k>0]
+            # encodes `time_scale_factor` pixel frames each. For a held image,
+            # latent[1] is already "8 frames of the held image", so we just
+            # repeat the trailing latent frame to reach the target hold.
+            if hold_px > image_1.shape[0]:
+                tail_px = image_1[-1:].expand(hold_px - image_1.shape[0], -1, -1, -1)
+                image_1 = torch.cat([image_1, tail_px], dim=0)
+
+                target_latent = (hold_px - 1) // time_scale_factor + 1
+                if target_latent > t.shape[2] and t.shape[2] >= 2:
+                    additional = target_latent - t.shape[2]
+                    tail = t[:, :, -1:].expand(-1, -1, additional, -1, -1).contiguous()
+                    t = torch.cat([t, tail], dim=2)
+
             frame_idx, latent_idx = cls.get_latent_index(positive, latent_length, len(image_1), f_idx, scale_factors)
 
             assert latent_idx + t.shape[2] <= latent_length, (
