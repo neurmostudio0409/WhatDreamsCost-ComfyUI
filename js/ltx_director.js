@@ -1416,7 +1416,7 @@ class TimelineEditor {
           if (this.selectionType === "image" && this.timeline.segments[this.selectedIndex]) {
             const seg = this.timeline.segments[this.selectedIndex];
             if (seg.type !== "text") {
-              seg.loopCount = v;
+              this.applyLoopCountChange(seg, v);
               this.commitChanges();
             }
           }
@@ -1440,7 +1440,7 @@ class TimelineEditor {
       if (this.selectionType === "image" && this.timeline.segments[this.selectedIndex]) {
         const seg = this.timeline.segments[this.selectedIndex];
         if (seg.type !== "text") {
-          seg.loopCount = v;
+          this.applyLoopCountChange(seg, v);
           this.commitChanges();
         }
       }
@@ -2052,6 +2052,53 @@ class TimelineEditor {
           }
           this.ctx.restore();
         }
+      }
+
+      // --- Loop cycle separators + ×N badge (image segments with loopCount > 1) ---
+      const loopCount = (seg.type !== "text" && seg.type !== "ghost")
+        ? Math.max(1, parseInt(seg.loopCount, 10) || 1) : 1;
+      if (loopCount > 1) {
+        // Dashed vertical separators between cycles
+        const cycleWidth = pxWidth / loopCount;
+        this.ctx.save();
+        this.ctx.strokeStyle = "rgba(255, 255, 255, 0.55)";
+        this.ctx.lineWidth = 1;
+        this.ctx.setLineDash([4, 3]);
+        for (let c = 1; c < loopCount; c++) {
+          const sx = startX + cycleWidth * c;
+          this.ctx.beginPath();
+          this.ctx.moveTo(sx, RULER_HEIGHT + 2);
+          this.ctx.lineTo(sx, RULER_HEIGHT + this.blockHeight - 2);
+          this.ctx.stroke();
+        }
+        this.ctx.setLineDash([]);
+        this.ctx.restore();
+
+        // ×N badge at top-right corner
+        const badgeText = "×" + loopCount;
+        this.ctx.save();
+        this.ctx.font = "bold 11px sans-serif";
+        const padX = 5;
+        const padY = 2;
+        const textW = this.ctx.measureText(badgeText).width;
+        const badgeW = textW + padX * 2;
+        const badgeH = 16;
+        const badgeX = startX + pxWidth - badgeW - 4;
+        const badgeY = RULER_HEIGHT + 4;
+        if (badgeX > startX + 2) {
+          this.ctx.fillStyle = "rgba(0, 0, 0, 0.78)";
+          this.ctx.strokeStyle = "rgba(255, 255, 255, 0.45)";
+          this.ctx.lineWidth = 1;
+          this.ctx.beginPath();
+          this.ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
+          this.ctx.fill();
+          this.ctx.stroke();
+          this.ctx.fillStyle = "#ffd479";
+          this.ctx.textAlign = "center";
+          this.ctx.textBaseline = "middle";
+          this.ctx.fillText(badgeText, badgeX + badgeW / 2, badgeY + badgeH / 2 + 0.5);
+        }
+        this.ctx.restore();
       }
 
       if (isSelected) {
@@ -2874,6 +2921,54 @@ class TimelineEditor {
   }
 
   // --- Backend Data Sync ---
+  // Change a segment's loopCount and shift every later segment (image + audio)
+  // by the delta so the looped segment doesn't overwrite its neighbours. For
+  // shrinking the loop, we clamp at the new effective end to avoid overlapping
+  // the looped segment itself. No-op when the value doesn't change.
+  applyLoopCountChange(seg, newLoop) {
+    const oldLoop = Math.max(1, parseInt(seg.loopCount, 10) || 1);
+    newLoop = Math.max(1, parseInt(newLoop, 10) || 1);
+    if (newLoop === oldLoop) {
+      seg.loopCount = newLoop;
+      return;
+    }
+
+    const delta = (newLoop - oldLoop) * seg.length;
+    const oldEnd = seg.start + seg.length * oldLoop;
+    const newEnd = seg.start + seg.length * newLoop;
+
+    const shiftList = (list) => {
+      if (!Array.isArray(list)) return;
+      for (const other of list) {
+        if (other.id === seg.id) continue;
+        if (other.start >= oldEnd) {
+          other.start = Math.max(newEnd, other.start + delta);
+        }
+      }
+    };
+    shiftList(this.timeline.segments);
+    shiftList(this.timeline.audioSegments);
+
+    seg.loopCount = newLoop;
+
+    // Grow duration_frames to cover the new effective end of every segment so the
+    // commitChanges cutoff doesn't silently drop the segments we just shifted out.
+    // We never shrink — that's the user's call.
+    let maxEnd = 0;
+    for (const s of this.timeline.segments) {
+      maxEnd = Math.max(maxEnd, s.start + getEffectiveLength(s));
+    }
+    for (const s of this.timeline.audioSegments) {
+      maxEnd = Math.max(maxEnd, s.start + s.length);
+    }
+    if (this.durationFramesWidget && maxEnd > this.getDurationFrames()) {
+      this.durationFramesWidget.value = maxEnd;
+      if (this.durationFramesWidget.callback) {
+        this.durationFramesWidget.callback(maxEnd);
+      }
+    }
+  }
+
   commitChanges(skipRender = false) {
     let sortedSegments = [...this.timeline.segments].sort((a, b) => a.start - b.start);
     // Expand image segments with loopCount > 1 into N back-to-back virtual entries
