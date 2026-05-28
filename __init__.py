@@ -7,7 +7,13 @@ from .load_video_ui import LoadVideoUI
 from .ltx_director import LTXDirector
 from .ltx_director_guide import LTXDirectorGuide
 from .wan_director import WanDirector, WanS2VDirector, WanVaceDirector, WanAnimateDirector
-from .long_video_stitcher import LongVideoStitcher, LatentTailToImage, LongChunkSampler
+from .long_video_stitcher import (
+    LongVideoStitcher,
+    LatentTailToImage,
+    LongChunkSampler,
+    LongChunkSamplerMulti,
+    LightningLoraPreset,
+)
 from comfy_api.latest import ComfyExtension, io
 from typing_extensions import override
 
@@ -24,6 +30,8 @@ class PromptRelay(ComfyExtension):
             LongVideoStitcher,
             LatentTailToImage,
             LongChunkSampler,
+            LongChunkSamplerMulti,
+            LightningLoraPreset,
         ]
 
 async def comfy_entrypoint() -> PromptRelay:
@@ -45,6 +53,8 @@ NODE_CLASS_MAPPINGS = {
     "LongVideoStitcher": LongVideoStitcher,
     "LatentTailToImage": LatentTailToImage,
     "LongChunkSampler": LongChunkSampler,
+    "LongChunkSamplerMulti": LongChunkSamplerMulti,
+    "LightningLoraPreset": LightningLoraPreset,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -63,6 +73,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LongVideoStitcher": "Long Video Stitcher",
     "LatentTailToImage": "Latent Tail to Image",
     "LongChunkSampler": "Long Chunk Sampler",
+    "LongChunkSamplerMulti": "Long Chunk Sampler (Multi-Prompt)",
+    "LightningLoraPreset": "Lightning LoRA Preset",
 }
 
 WEB_DIRECTORY = "./js"

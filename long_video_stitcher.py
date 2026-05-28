@@ -29,6 +29,9 @@ import math
 import torch
 
 import comfy.samplers
+import comfy.sd
+import comfy.utils
+import folder_paths
 import nodes
 
 from comfy_api.latest import io
@@ -396,6 +399,241 @@ class LongChunkSampler(io.ComfyNode):
         final = torch.cat(stitched_parts, dim=2)
         log.info(
             "[LongChunkSampler] Final stitched latent: %s (chunks=%d, per-chunk T=%d, overlap=%d)",
+            tuple(final.shape), num_chunks, base_T, overlap,
+        )
+        return io.NodeOutput({"samples": final})
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Lightning LoRA preset + per-chunk-prompt sampler
+# ---------------------------------------------------------------------------
+
+
+# Preset name -> (steps, cfg, sampler_name, scheduler).
+# Tuned for the most common community Lightning distillations. "custom" leaves
+# the sampler params at sensible defaults but the user is expected to override.
+_LIGHTNING_PRESETS = {
+    "LTX 4-step":  (4, 1.0, "euler",   "simple"),
+    "LTX 8-step":  (8, 1.0, "euler",   "simple"),
+    "Wan 4-step":  (4, 1.0, "euler",   "simple"),
+    "Wan 6-step":  (6, 1.0, "euler",   "simple"),
+    "Wan 8-step":  (8, 1.0, "euler",   "simple"),
+    "custom":      (8, 1.0, "euler",   "normal"),
+}
+
+
+class LightningLoraPreset(io.ComfyNode):
+    """Apply a Lightning / distilled LoRA and emit the recommended sampler config.
+
+    Bundles `LoraLoader` + the "what steps / cfg / sampler / scheduler do I
+    use for this 4-step Lightning thing?" lookup into one node. Wire the
+    `steps / cfg / sampler_name / scheduler` outputs into KSampler (or
+    LongChunkSampler) so you don't have to remember the magic numbers.
+
+    For Wan2.2 MoE 14B, this only patches one model. If you want the
+    high-noise and low-noise pair both patched, chain two of these nodes (one
+    per model) with the same LoRA, or call LoraLoaderModelOnly twice.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LightningLoraPreset",
+            display_name="Lightning LoRA Preset",
+            category="WhatDreamsCost",
+            description=(
+                "Apply a Lightning / distilled LoRA to the model (and optionally CLIP) "
+                "and output the recommended sampler config for the chosen preset. "
+                "Wire steps/cfg/sampler_name/scheduler into KSampler or LongChunkSampler."
+            ),
+            inputs=[
+                io.Model.Input("model", tooltip="Diffusion model to apply the LoRA to."),
+                io.Clip.Input("clip", optional=True, tooltip="Optional CLIP to also patch."),
+                io.Combo.Input(
+                    "lora_name", options=folder_paths.get_filename_list("loras"),
+                    tooltip="The Lightning / distilled LoRA to apply.",
+                ),
+                io.Float.Input(
+                    "strength_model", default=1.0, min=-10.0, max=10.0, step=0.05,
+                    tooltip="LoRA strength on the diffusion model. 1.0 = full effect.",
+                ),
+                io.Float.Input(
+                    "strength_clip", default=1.0, min=-10.0, max=10.0, step=0.05, optional=True,
+                    tooltip="LoRA strength on CLIP (ignored if no clip is connected).",
+                ),
+                io.Combo.Input(
+                    "preset", options=list(_LIGHTNING_PRESETS.keys()), default="LTX 4-step",
+                    tooltip=(
+                        "Sampler recipe. Affects the steps/cfg/sampler_name/scheduler outputs "
+                        "only — the LoRA is always applied. 'custom' = pass-through defaults; "
+                        "override the sampler params manually."
+                    ),
+                ),
+            ],
+            outputs=[
+                io.Model.Output(display_name="model"),
+                io.Clip.Output(display_name="clip"),
+                io.Int.Output(display_name="steps"),
+                io.Float.Output(display_name="cfg"),
+                io.Combo.Output(
+                    display_name="sampler_name",
+                    options=list(comfy.samplers.KSampler.SAMPLERS),
+                ),
+                io.Combo.Output(
+                    display_name="scheduler",
+                    options=list(comfy.samplers.KSampler.SCHEDULERS),
+                ),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, lora_name, strength_model, preset,
+                clip=None, strength_clip=1.0) -> io.NodeOutput:
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+
+        # load_lora_for_models accepts clip=None; the second return is then None too.
+        # We swap a None clip back to whatever the caller passed (often None) so the
+        # node's CLIP output passes through cleanly.
+        model_out, clip_out = comfy.sd.load_lora_for_models(
+            model, clip, lora, float(strength_model), float(strength_clip),
+        )
+        if clip_out is None:
+            clip_out = clip
+
+        steps, cfg, sampler_name, scheduler = _LIGHTNING_PRESETS[preset]
+        log.info(
+            "[LightningLoraPreset] Applied %s @ model=%.2f clip=%.2f, preset=%s "
+            "(steps=%d, cfg=%.2f, sampler=%s, scheduler=%s)",
+            lora_name, strength_model, strength_clip, preset,
+            steps, cfg, sampler_name, scheduler,
+        )
+        return io.NodeOutput(model_out, clip_out, steps, cfg, sampler_name, scheduler)
+
+
+class LongChunkSamplerMulti(io.ComfyNode):
+    """Per-chunk-prompt variant of LongChunkSampler.
+
+    Accepts up to 6 positive conditionings (one per chunk) plus a single shared
+    negative. The sampler runs once per provided positive, seeding each chunk
+    after the first from the previous chunk's tail latent (the leading
+    `seed_overlap_latent_frames` are locked via noise_mask=0). num_chunks is
+    derived from the number of positives connected.
+
+    Use this when each chunk should be driven by a different prompt (so each
+    Director produces its own positive). The model is shared across all
+    chunks — the model's prompt-relay mask must therefore be valid for the
+    chunk-length latent of every chunk. Easiest way: use the same chunk_length
+    timeline_data in every Director.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LongChunkSamplerMulti",
+            display_name="Long Chunk Sampler (Multi-Prompt)",
+            category="WhatDreamsCost",
+            description=(
+                "Runs KSampler once per connected positive conditioning, seeding each "
+                "chunk after the first from the previous chunk's tail. For per-chunk "
+                "prompt evolution. num_chunks = number of positive inputs connected."
+            ),
+            inputs=[
+                io.Model.Input("model"),
+                io.Conditioning.Input("negative", tooltip="Negative conditioning, shared across every chunk."),
+                io.Latent.Input("latent", tooltip="Chunk-length latent template (output of a Director)."),
+                io.Conditioning.Input("positive_1", tooltip="Chunk 1 positive (required)."),
+                io.Conditioning.Input("positive_2", optional=True, tooltip="Chunk 2 positive."),
+                io.Conditioning.Input("positive_3", optional=True, tooltip="Chunk 3 positive."),
+                io.Conditioning.Input("positive_4", optional=True, tooltip="Chunk 4 positive."),
+                io.Conditioning.Input("positive_5", optional=True, tooltip="Chunk 5 positive."),
+                io.Conditioning.Input("positive_6", optional=True, tooltip="Chunk 6 positive."),
+                io.Int.Input(
+                    "seed_overlap_latent_frames", default=1, min=1, max=16, step=1,
+                    tooltip="Latent frames at the front of each chunk after the first that are locked to the previous chunk's tail.",
+                ),
+                io.Int.Input("steps", default=20, min=1, max=200, step=1),
+                io.Float.Input("cfg", default=3.0, min=0.0, max=20.0, step=0.1),
+                io.Combo.Input("sampler_name", options=comfy.samplers.KSampler.SAMPLERS, default="euler"),
+                io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="normal"),
+                io.Int.Input(
+                    "seed", default=0, min=0, max=0xffffffffffffffff,
+                    tooltip="Base seed. Chunk K uses seed + K.",
+                ),
+                io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, negative, latent, positive_1,
+                positive_2=None, positive_3=None, positive_4=None,
+                positive_5=None, positive_6=None,
+                seed_overlap_latent_frames=1,
+                steps=20, cfg=3.0, sampler_name="euler", scheduler="normal",
+                seed=0, denoise=1.0) -> io.NodeOutput:
+        positives = [p for p in (positive_1, positive_2, positive_3, positive_4,
+                                 positive_5, positive_6) if p is not None]
+        num_chunks = len(positives)
+
+        base_samples = latent["samples"]
+        if base_samples.dim() != 5:
+            raise ValueError(
+                f"LongChunkSamplerMulti: expected a 5D video latent [B,C,T,H,W], got "
+                f"shape {tuple(base_samples.shape)}."
+            )
+
+        base_T = base_samples.shape[2]
+        overlap = max(1, int(seed_overlap_latent_frames))
+        if overlap >= base_T:
+            raise ValueError(
+                f"LongChunkSamplerMulti: seed_overlap_latent_frames ({overlap}) must be "
+                f"smaller than the latent's temporal length ({base_T})."
+            )
+
+        all_chunks = []
+        for chunk_idx, positive in enumerate(positives):
+            chunk_seed = (int(seed) + chunk_idx) & 0xffffffffffffffff
+
+            if chunk_idx == 0:
+                chunk_latent = latent
+            else:
+                prev_samples = all_chunks[-1]["samples"]
+                new_samples = base_samples.clone()
+                copy = min(overlap, prev_samples.shape[2])
+                new_samples[:, :, :copy] = prev_samples[:, :, -copy:]
+                mask = torch.ones(
+                    (new_samples.shape[0], 1, new_samples.shape[2], 1, 1),
+                    dtype=new_samples.dtype, device=new_samples.device,
+                )
+                mask[:, :, :copy] = 0.0
+                chunk_latent = {"samples": new_samples, "noise_mask": mask}
+
+            log.info(
+                "[LongChunkSamplerMulti] Chunk %d/%d: seed=%d, latent shape=%s",
+                chunk_idx + 1, num_chunks, chunk_seed,
+                tuple(chunk_latent["samples"].shape),
+            )
+
+            sampled = nodes.common_ksampler(
+                model, chunk_seed, int(steps), float(cfg), sampler_name, scheduler,
+                positive, negative, chunk_latent, denoise=float(denoise),
+            )[0]
+            all_chunks.append(sampled)
+
+        stitched_parts = [all_chunks[0]["samples"]]
+        for chunk in all_chunks[1:]:
+            s = chunk["samples"]
+            if overlap < s.shape[2]:
+                stitched_parts.append(s[:, :, overlap:])
+            else:
+                stitched_parts.append(s)
+
+        final = torch.cat(stitched_parts, dim=2)
+        log.info(
+            "[LongChunkSamplerMulti] Final stitched latent: %s (chunks=%d, per-chunk T=%d, overlap=%d)",
             tuple(final.shape), num_chunks, base_T, overlap,
         )
         return io.NodeOutput({"samples": final})
