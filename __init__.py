@@ -7,6 +7,7 @@ from .load_video_ui import LoadVideoUI
 from .ltx_director import LTXDirector
 from .ltx_director_guide import LTXDirectorGuide
 from .wan_director import WanDirector, WanS2VDirector, WanVaceDirector, WanAnimateDirector
+from .long_video_stitcher import LongVideoStitcher, LatentTailToImage
 from comfy_api.latest import ComfyExtension, io
 from typing_extensions import override
 
@@ -20,6 +21,8 @@ class PromptRelay(ComfyExtension):
             WanS2VDirector,
             WanVaceDirector,
             WanAnimateDirector,
+            LongVideoStitcher,
+            LatentTailToImage,
         ]
 
 async def comfy_entrypoint() -> PromptRelay:
@@ -38,6 +41,8 @@ NODE_CLASS_MAPPINGS = {
     "WanS2VDirector": WanS2VDirector,
     "WanVaceDirector": WanVaceDirector,
     "WanAnimateDirector": WanAnimateDirector,
+    "LongVideoStitcher": LongVideoStitcher,
+    "LatentTailToImage": LatentTailToImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -53,6 +58,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanS2VDirector": "Wan S2V Director",
     "WanVaceDirector": "Wan VACE Director",
     "WanAnimateDirector": "Wan Animate Director",
+    "LongVideoStitcher": "Long Video Stitcher",
+    "LatentTailToImage": "Latent Tail to Image",
 }
 
 WEB_DIRECTORY = "./js"
