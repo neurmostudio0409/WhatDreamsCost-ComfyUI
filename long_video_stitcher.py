@@ -1,27 +1,35 @@
 """Long Video Stitcher — utilities for chaining multiple Director/sampler chunks
 into a single long video latent.
 
-Two nodes:
+Three nodes:
 
-- LongVideoStitcher: concatenates up to 6 latent chunks along the temporal axis,
-  with optional `overlap_frames` to drop the trailing frames of each preceding
-  chunk (use this when chunk K+1 was generated with chunk K's tail frame as a
-  start keyframe, so the duplicate frames at the seam should be dropped).
+- LongVideoStitcher: concatenates up to 6 latent chunks along the temporal axis.
+  Supports three seam modes: `drop` (drop overlap_frames from each preceding
+  chunk — Phase 1 behaviour), `linear` (linear crossfade across the overlap),
+  `cosine` (smooth cosine crossfade, usually the best quality).
 
 - LatentTailToImage: VAE-decodes the trailing N frames of a latent into a pixel
   image, intended as the start_image for the next chunk's Director timeline.
   This is the "frame_offset" pattern for LTX, which has no native frame_offset
   the way Wan's S2V / Animate / VACE do.
 
+- LongChunkSampler: runs KSampler N times in one node, seeding each chunk from
+  the previous chunk's tail latent (the front `seed_overlap_latent_frames` of
+  every chunk after the first is locked to the previous chunk's tail via a
+  noise_mask). Output is a single stitched latent. Best for "hold B for a long
+  time" workflows where the conditioning is the same across chunks.
+
 Audio latents are handled separately — these nodes operate on video latents
-only. Combine the chunked audio with the final video in a downstream node
-(e.g. VHS_VideoCombine) or stitch the audio independently with the Audio
-track in LTX Director.
+only.
 """
 
 import logging
+import math
 
 import torch
+
+import comfy.samplers
+import nodes
 
 from comfy_api.latest import io
 
@@ -29,28 +37,43 @@ from comfy_api.latest import io
 log = logging.getLogger(__name__)
 
 
-def _concat_latents(latents, overlap_frames):
-    """Concatenate latent chunks along the temporal axis (dim=2).
+def _blend_overlap(left_tail, right_head, mode):
+    """Crossfade left_tail into right_head along time dim using the given mode.
 
-    overlap_frames > 0 drops the LAST `overlap_frames` of each preceding chunk
-    (every chunk except the last). Use this when chunk K's tail was reused as
-    chunk K+1's start so the overlapping frames don't appear twice in the
-    stitched output.
+    Both tensors must have shape [B, C, T_overlap, H, W]. Returns a new
+    tensor of the same shape. `mode` is one of "linear" or "cosine".
+    """
+    T = left_tail.shape[2]
+    device = left_tail.device
+    dtype = left_tail.dtype
+    if mode == "linear":
+        alpha = torch.linspace(0.0, 1.0, T, dtype=dtype, device=device)
+    else:  # cosine
+        t_lin = torch.linspace(0.0, 1.0, T, dtype=dtype, device=device)
+        alpha = 0.5 - 0.5 * torch.cos(math.pi * t_lin)
+    alpha = alpha.view(1, 1, T, 1, 1)
+    return left_tail * (1.0 - alpha) + right_head * alpha
 
-    Returns a single latent dict with key "samples". `noise_mask` keys on
-    individual chunks are dropped — sampling has already happened.
+
+def _concat_latents(latents, overlap_frames, blend_mode="drop"):
+    """Stitch latent chunks along the temporal axis (dim=2).
+
+    - blend_mode="drop":   drop the last `overlap_frames` of each preceding chunk
+    - blend_mode="linear": crossfade prev tail with next head, linearly
+    - blend_mode="cosine": crossfade prev tail with next head, cosine-eased
+
+    For the blend modes, BOTH the trailing N frames of the preceding chunk and
+    the leading N frames of the following chunk are consumed by the blend (so
+    the seam consumes 2N source frames and emits N blended frames).
+
+    Returns {"samples": stitched_tensor}. Per-chunk noise_mask keys are dropped.
     """
     if not latents:
         raise ValueError("LongVideoStitcher: no latents to stitch.")
 
-    samples_list = []
-    for i, lat in enumerate(latents):
-        s = lat["samples"]
-        if overlap_frames > 0 and i < len(latents) - 1 and s.shape[2] > overlap_frames:
-            s = s[:, :, :-overlap_frames]
-        samples_list.append(s)
+    samples_list = [lat["samples"] for lat in latents]
 
-    # Sanity-check shapes match on B / C / H / W
+    # Sanity-check shapes match on B / C / H / W.
     ref = samples_list[0]
     for i, s in enumerate(samples_list[1:], start=1):
         if (s.shape[0], s.shape[1], s.shape[3], s.shape[4]) != \
@@ -61,13 +84,45 @@ def _concat_latents(latents, overlap_frames):
                 "dims must agree)."
             )
 
-    combined = torch.cat(samples_list, dim=2)
+    if overlap_frames <= 0 or blend_mode == "drop":
+        # Drop mode: trim trailing overlap_frames from every chunk except the last.
+        parts = []
+        for i, s in enumerate(samples_list):
+            if overlap_frames > 0 and i < len(samples_list) - 1 and s.shape[2] > overlap_frames:
+                s = s[:, :, :-overlap_frames]
+            parts.append(s)
+        combined = torch.cat(parts, dim=2)
+    else:
+        # Crossfade mode: blend overlap region across each seam.
+        parts = [samples_list[0]]
+        for i in range(1, len(samples_list)):
+            prev = parts[-1]
+            curr = samples_list[i]
+            # If either side is shorter than overlap_frames, fall back to drop
+            # to avoid mangling short chunks.
+            if prev.shape[2] <= overlap_frames or curr.shape[2] <= overlap_frames:
+                if prev.shape[2] > overlap_frames:
+                    parts[-1] = prev[:, :, :-overlap_frames]
+                parts.append(curr)
+                continue
+
+            prev_main = prev[:, :, :-overlap_frames]
+            prev_tail = prev[:, :, -overlap_frames:]
+            curr_head = curr[:, :, :overlap_frames]
+            curr_main = curr[:, :, overlap_frames:]
+            blended = _blend_overlap(prev_tail, curr_head, blend_mode)
+            parts[-1] = torch.cat([prev_main, blended], dim=2)
+            parts.append(curr_main)
+        combined = torch.cat(parts, dim=2)
+
     log.info(
-        "[LongVideoStitcher] Stitched %d chunks: %s -> %s (overlap_frames=%d)",
-        len(latents), [tuple(s.shape) for s in samples_list], tuple(combined.shape),
-        overlap_frames,
+        "[LongVideoStitcher] Stitched %d chunks with mode=%s overlap=%d -> %s",
+        len(latents), blend_mode, overlap_frames, tuple(combined.shape),
     )
     return {"samples": combined}
+
+
+_BLEND_MODES = ["drop", "linear", "cosine"]
 
 
 class LongVideoStitcher(io.ComfyNode):
@@ -76,6 +131,11 @@ class LongVideoStitcher(io.ComfyNode):
     Typical use: run the Director + Sampler N times (each chunk seeded from the
     previous chunk's last frame via `LatentTailToImage`), connect the resulting
     latents in order, and feed the stitched output into a single VAE Decode.
+
+    For the smoothest seam between chunks use `blend_mode="cosine"` with
+    `overlap_frames` set to the number of latent frames you want the crossfade
+    to span — both sides of the seam contribute, so a small overlap (2–4
+    latent frames) is usually enough to hide the boundary.
     """
 
     @classmethod
@@ -86,9 +146,10 @@ class LongVideoStitcher(io.ComfyNode):
             category="WhatDreamsCost",
             description=(
                 "Concatenates up to 6 video latents along the temporal axis. "
-                "Drop the trailing overlap of each preceding chunk via overlap_frames "
-                "if you seeded chunk K+1 from chunk K's last frame (so the seam frame "
-                "doesn't appear twice). Channels / spatial dims of all chunks must match."
+                "blend_mode=drop trims the trailing overlap_frames of each preceding "
+                "chunk; blend_mode=linear/cosine crossfades the overlap region across "
+                "each seam for a smoother boundary. Channels / spatial dims of all "
+                "chunks must match."
             ),
             inputs=[
                 io.Latent.Input("latent_1", tooltip="First chunk (required)."),
@@ -100,9 +161,20 @@ class LongVideoStitcher(io.ComfyNode):
                 io.Int.Input(
                     "overlap_frames", default=0, min=0, max=64, step=1, optional=True,
                     tooltip=(
-                        "Latent frames to drop from the end of each preceding chunk. "
-                        "Use this when chunk K+1 was seeded with chunk K's tail frame "
-                        "to avoid the seam appearing twice. 0 = pure concat."
+                        "Latent frames to consume at each seam. For drop mode this is the "
+                        "number of frames trimmed from each preceding chunk's tail. For "
+                        "linear/cosine this is the crossfade width — both sides of the seam "
+                        "contribute, so 2–4 is usually enough."
+                    ),
+                ),
+                io.Combo.Input(
+                    "blend_mode", options=_BLEND_MODES, default="drop", optional=True,
+                    tooltip=(
+                        "drop = trim overlap from preceding chunk (Phase 1 behaviour). "
+                        "linear = linear crossfade across overlap. cosine = smooth cosine "
+                        "crossfade (best quality for visible seams). drop is the safest "
+                        "choice when chunk K+1 was seeded from chunk K's tail and you don't "
+                        "want the blend re-introducing the duplicate."
                     ),
                 ),
             ],
@@ -113,10 +185,11 @@ class LongVideoStitcher(io.ComfyNode):
 
     @classmethod
     def execute(cls, latent_1, latent_2=None, latent_3=None, latent_4=None,
-                latent_5=None, latent_6=None, overlap_frames=0) -> io.NodeOutput:
+                latent_5=None, latent_6=None, overlap_frames=0,
+                blend_mode="drop") -> io.NodeOutput:
         chunks = [l for l in (latent_1, latent_2, latent_3, latent_4, latent_5, latent_6)
                   if l is not None]
-        out = _concat_latents(chunks, int(overlap_frames))
+        out = _concat_latents(chunks, int(overlap_frames), blend_mode)
         return io.NodeOutput(out)
 
 
@@ -179,3 +252,150 @@ class LatentTailToImage(io.ComfyNode):
             n, tuple(samples.shape), tuple(decoded.shape),
         )
         return io.NodeOutput(decoded)
+
+
+class LongChunkSampler(io.ComfyNode):
+    """Run KSampler N times to produce a long video latent in one node.
+
+    Each chunk after the first has its leading `seed_overlap_latent_frames`
+    locked to the previous chunk's tail (via a noise_mask = 0 on those
+    frames), so the sampler must denoise the remainder consistent with the
+    seeded prefix. The stitched output drops the seeded prefix of each
+    chunk after the first so the seam doesn't double up.
+
+    Best fit: "extend the same shot for N × chunk_length" workflows where
+    the same conditioning (positive / negative / model) applies across all
+    chunks. For per-chunk prompt evolution chain Director + KSampler
+    manually and use LongVideoStitcher to combine.
+
+    Notes:
+    - The conditioning is identical for every chunk, including any
+      prompt-relay attention mask that was patched onto the model. The
+      latent shape must match the shape the mask was built for, which is
+      automatic when the input `latent` came straight from the same
+      Director that patched the model.
+    - For Wan I2V/FLF this still re-anchors each chunk on the original
+      start_image (because that's baked into the positive conditioning via
+      concat_latent_image). Use only for hold-style extensions on Wan.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LongChunkSampler",
+            display_name="Long Chunk Sampler",
+            category="WhatDreamsCost",
+            description=(
+                "Runs KSampler num_chunks times, seeding each chunk after the first "
+                "from the previous chunk's tail (locked via noise_mask), and outputs "
+                "a single stitched latent. Same conditioning for every chunk; for "
+                "per-chunk prompt evolution chain Director + KSampler manually."
+            ),
+            inputs=[
+                io.Model.Input("model"),
+                io.Conditioning.Input("positive"),
+                io.Conditioning.Input("negative"),
+                io.Latent.Input("latent", tooltip="Chunk-length latent (output of a Director)."),
+                io.Int.Input(
+                    "num_chunks", default=3, min=1, max=20, step=1,
+                    tooltip="How many chunks to generate and stitch. Total output length = chunk_length × num_chunks − (num_chunks − 1) × seed_overlap_latent_frames.",
+                ),
+                io.Int.Input(
+                    "seed_overlap_latent_frames", default=1, min=1, max=16, step=1,
+                    tooltip="Latent frames at the front of each chunk (after the first) that are locked to the previous chunk's tail. Drives continuity at every seam.",
+                ),
+                io.Int.Input(
+                    "steps", default=20, min=1, max=200, step=1,
+                ),
+                io.Float.Input(
+                    "cfg", default=3.0, min=0.0, max=20.0, step=0.1,
+                ),
+                io.Combo.Input(
+                    "sampler_name", options=comfy.samplers.KSampler.SAMPLERS, default="euler",
+                ),
+                io.Combo.Input(
+                    "scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="normal",
+                ),
+                io.Int.Input(
+                    "seed", default=0, min=0, max=0xffffffffffffffff,
+                    tooltip="Base seed. Each chunk uses seed + chunk_index so they don't all collapse to the same noise pattern.",
+                ),
+                io.Float.Input(
+                    "denoise", default=1.0, min=0.0, max=1.0, step=0.01,
+                ),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, positive, negative, latent,
+                num_chunks=3, seed_overlap_latent_frames=1,
+                steps=20, cfg=3.0, sampler_name="euler", scheduler="normal",
+                seed=0, denoise=1.0) -> io.NodeOutput:
+        base_samples = latent["samples"]
+        if base_samples.dim() != 5:
+            raise ValueError(
+                f"LongChunkSampler: expected a 5D video latent [B,C,T,H,W], got shape "
+                f"{tuple(base_samples.shape)}."
+            )
+
+        base_T = base_samples.shape[2]
+        overlap = max(1, int(seed_overlap_latent_frames))
+        if overlap >= base_T:
+            raise ValueError(
+                f"LongChunkSampler: seed_overlap_latent_frames ({overlap}) must be smaller "
+                f"than the latent's temporal length ({base_T})."
+            )
+
+        num_chunks = max(1, int(num_chunks))
+        all_chunks = []
+
+        for chunk_idx in range(num_chunks):
+            chunk_seed = (int(seed) + chunk_idx) & 0xffffffffffffffff
+
+            if chunk_idx == 0:
+                chunk_latent = latent
+            else:
+                prev_samples = all_chunks[-1]["samples"]
+                new_samples = base_samples.clone()
+                copy = min(overlap, prev_samples.shape[2])
+                new_samples[:, :, :copy] = prev_samples[:, :, -copy:]
+                # noise_mask=0 means "preserve" (don't denoise this region) for the
+                # ComfyUI sampler. Shape [B,1,T,1,1] broadcasts across spatial dims.
+                mask = torch.ones(
+                    (new_samples.shape[0], 1, new_samples.shape[2], 1, 1),
+                    dtype=new_samples.dtype, device=new_samples.device,
+                )
+                mask[:, :, :copy] = 0.0
+                chunk_latent = {"samples": new_samples, "noise_mask": mask}
+
+            log.info(
+                "[LongChunkSampler] Chunk %d/%d: seed=%d, latent shape=%s",
+                chunk_idx + 1, num_chunks, chunk_seed,
+                tuple(chunk_latent["samples"].shape),
+            )
+
+            sampled = nodes.common_ksampler(
+                model, chunk_seed, int(steps), float(cfg), sampler_name, scheduler,
+                positive, negative, chunk_latent, denoise=float(denoise),
+            )[0]
+            all_chunks.append(sampled)
+
+        # Stitch: drop the seeded prefix from every chunk after the first so the
+        # overlap doesn't double up. Chunk 0 contributes its full latent.
+        stitched_parts = [all_chunks[0]["samples"]]
+        for chunk in all_chunks[1:]:
+            s = chunk["samples"]
+            if overlap < s.shape[2]:
+                stitched_parts.append(s[:, :, overlap:])
+            else:
+                stitched_parts.append(s)
+
+        final = torch.cat(stitched_parts, dim=2)
+        log.info(
+            "[LongChunkSampler] Final stitched latent: %s (chunks=%d, per-chunk T=%d, overlap=%d)",
+            tuple(final.shape), num_chunks, base_T, overlap,
+        )
+        return io.NodeOutput({"samples": final})
