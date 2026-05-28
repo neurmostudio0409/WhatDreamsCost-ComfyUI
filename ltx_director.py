@@ -529,16 +529,11 @@ class LTXDirector(io.ComfyNode):
                     derived_h = tensor.shape[1]
                     derived_w = tensor.shape[2]
 
-                # Loop count: replicate the image along the time/batch dim so the VAE encodes
-                # it as `loop_count` latent frames, all locked to the same image. The model
-                # still generates a smooth transition AFTER the held region into the next keyframe.
-                # LTXVAddGuide.encode crops to (8n+1) frames, so anything between strides is
-                # truncated back to the previous valid value (loop=2..8 collapses to loop=1).
-                # Snap up to the next valid 8n+1 so small loop values produce a visible hold.
-                loop_count = max(1, int(seg.get("loopCount", 1)))
-                if loop_count > 1:
-                    loop_count = ((loop_count + 6) // 8) * 8 + 1
-                    tensor = tensor.repeat(loop_count, 1, 1, 1)
+                # Per-segment looping is handled in the JS timeline editor: it expands
+                # any image segment with loopCount > 1 into N back-to-back virtual
+                # segments before serializing timeline_data / local_prompts / segment_lengths.
+                # By the time the segment reaches this loop it already represents a single
+                # cycle, so we just emit one keyframe per (expanded) segment.
 
                 strength = strengths[idx] if idx < len(strengths) else 1.0
                 guide_data["images"].append(tensor)

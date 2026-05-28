@@ -542,12 +542,49 @@ const ICONS = {
 };
 
 // --- Data Models ---
+
+// Image segments support a loopCount > 1, meaning the segment is repeated N times
+// back-to-back. The base `seg.length` is the cycle length; effective length on the
+// timeline is length * loopCount. Audio and text segments don't loop.
+function getEffectiveLength(seg) {
+  if (!seg) return 0;
+  const loop = parseInt(seg.loopCount, 10) || 1;
+  if (seg.type === "text" || loop <= 1) return seg.length;
+  return seg.length * loop;
+}
+
+// Flatten a list of segments by replicating each image segment with loopCount > 1
+// into N back-to-back copies. Each copy has loopCount=1 and start shifted by
+// i * length. Used for serialization to the Python side and for building the
+// contiguous prompts/lengths arrays.
+function expandLoopSegments(segs) {
+  const out = [];
+  for (const seg of segs) {
+    const loop = (seg && seg.type !== "text") ? (parseInt(seg.loopCount, 10) || 1) : 1;
+    if (loop > 1) {
+      for (let i = 0; i < loop; i++) {
+        out.push({ ...seg, start: seg.start + i * seg.length, loopCount: 1, id: `${seg.id}__loop_${i}` });
+      }
+    } else {
+      out.push(seg);
+    }
+  }
+  return out;
+}
+
 function parseInitial(jsonStr) {
   let parsed = { segments: [], audioSegments: [] };
   try {
     if (jsonStr) {
       const p = JSON.parse(jsonStr);
-      if (Array.isArray(p.segments)) parsed.segments = p.segments;
+      // Prefer _editorSegments (round-trip with loopCount preserved); fall back
+      // to segments for backward compatibility with workflows saved before the
+      // loop expansion was introduced.
+      if (Array.isArray(p._editorSegments)) {
+        parsed.segments = p._editorSegments;
+      } else if (Array.isArray(p.segments)) {
+        parsed.segments = p.segments;
+      }
       if (Array.isArray(p.audioSegments)) parsed.audioSegments = p.audioSegments;
     }
   } catch (e) { }
@@ -761,7 +798,7 @@ class TimelineEditor {
   getVisualDurationFrames() {
     let furthest = 0;
     for (const seg of this.timeline.segments) {
-      furthest = Math.max(furthest, seg.start + seg.length);
+      furthest = Math.max(furthest, seg.start + getEffectiveLength(seg));
     }
     for (const seg of this.timeline.audioSegments) {
       furthest = Math.max(furthest, seg.start + seg.length);
@@ -1355,7 +1392,7 @@ class TimelineEditor {
     this.loopValue.value = "1";
     this.loopValue.disabled = true;
     this.loopValue.style.cursor = "ew-resize";
-    this.loopValue.title = "How many pixel frames the keyframe is held before transitioning (1 = no hold; the model still generates a smooth move to the next keyframe afterwards).";
+    this.loopValue.title = "How many times this image segment is repeated back-to-back on the timeline (1 = no repeat; 5 = the segment occupies 5× its base length, with the same image inserted as a keyframe at each cycle boundary).";
 
     let loopDragging = false;
     let loopStartX = 0;
@@ -1510,7 +1547,7 @@ class TimelineEditor {
               for (let i = 0; i < this.timeline.segments.length; i++) {
                 let seg = this.timeline.segments[i];
                 if (newStart + newLength <= seg.start) break;
-                newStart = Math.max(newStart, seg.start + seg.length);
+                newStart = Math.max(newStart, seg.start + getEffectiveLength(seg));
               }
             }
 
@@ -1800,7 +1837,8 @@ class TimelineEditor {
     if (this.segmentBoundsDisplay) {
       if (seg) {
         const startStr = this.formatTime(seg.start, true);
-        const endStr = this.formatTime(seg.start + seg.length, true);
+        const endFrame = (this.selectionType === "image") ? seg.start + getEffectiveLength(seg) : seg.start + seg.length;
+        const endStr = this.formatTime(endFrame, true);
         this.segmentBoundsDisplay.textContent = `Start: ${startStr} | End: ${endStr}`;
       } else {
         this.segmentBoundsDisplay.textContent = "Start: - | End: -";
@@ -1864,7 +1902,7 @@ class TimelineEditor {
     for (let i = 0; i < sortedSegments.length; i++) {
       const seg = sortedSegments[i];
       const startX = (seg.start / totalFrames) * width;
-      const pxWidth = (seg.length / totalFrames) * width;
+      const pxWidth = (getEffectiveLength(seg) / totalFrames) * width;
       const isSelected = (this.selectionType === "image" && seg.id === activeSegId);
 
       const originalSeg = this.timeline.segments.find(s => s.id === seg.id);
@@ -2341,24 +2379,27 @@ class TimelineEditor {
       .sort((a, b) => a.start - b.start);
 
     const HANDLE_CORE = 4;
+    // For image segments the effective end is start + length * loopCount. Audio
+    // segments don't loop so effective length == length.
+    const effLen = (s) => trackType === "image" ? getEffectiveLength(s) : s.length;
 
     for (let i = 0; i < sortedSegments.length; i++) {
       const seg = sortedSegments[i];
       const startX = (seg.start / totalFrames) * width;
-      const pxWidth = (seg.length / totalFrames) * width;
+      const pxWidth = (effLen(seg) / totalFrames) * width;
       const endX = startX + pxWidth;
 
       const prevSeg = sortedSegments[i - 1];
       const nextSeg = sortedSegments[i + 1];
 
-      const isLeftJoint = prevSeg && prevSeg.start + prevSeg.length === seg.start;
+      const isLeftJoint = prevSeg && prevSeg.start + effLen(prevSeg) === seg.start;
       if (!isLeftJoint) {
         if (Math.abs(mouseX - startX) <= HANDLE_HIT_PX) {
           return { type: "edge", index: seg.originalIndex, dir: "left", track: trackType };
         }
       }
 
-      const isRightJoint = nextSeg && nextSeg.start === seg.start + seg.length;
+      const isRightJoint = nextSeg && nextSeg.start === seg.start + effLen(seg);
       if (isRightJoint) {
         const dx = mouseX - endX;
         if (Math.abs(dx) <= HANDLE_HIT_PX) {
@@ -2380,7 +2421,7 @@ class TimelineEditor {
     for (let i = 0; i < sortedSegments.length; i++) {
       const seg = sortedSegments[i];
       const startX = (seg.start / totalFrames) * width;
-      const pxWidth = (seg.length / totalFrames) * width;
+      const pxWidth = (effLen(seg) / totalFrames) * width;
       const endX = startX + pxWidth;
 
       if (mouseX >= startX && mouseX < endX) {
@@ -2835,6 +2876,12 @@ class TimelineEditor {
   // --- Backend Data Sync ---
   commitChanges(skipRender = false) {
     let sortedSegments = [...this.timeline.segments].sort((a, b) => a.start - b.start);
+    // Expand image segments with loopCount > 1 into N back-to-back virtual entries
+    // for everything downstream (Python serialization + prompt/length distribution).
+    // The original sortedSegments stays untouched so the editor keeps the user's
+    // single-segment editing view.
+    let expandedSegments = expandLoopSegments(sortedSegments);
+
     let contiguousLengths = [];
     let contiguousPrompts = [];
     let currentCursor = 0;
@@ -2846,7 +2893,7 @@ class TimelineEditor {
     // - Segments that start at or past the cutoff are excluded entirely.
     // - Segments that cross the cutoff are trimmed so their end = durationFrames exactly.
     let pendingGap = 0;
-    for (let seg of sortedSegments) {
+    for (let seg of expandedSegments) {
       // Skip segments entirely outside the duration.
       if (seg.start >= durationFrames) break;
 
@@ -2876,11 +2923,14 @@ class TimelineEditor {
       contiguousLengths[contiguousLengths.length - 1] += durationFrames - clampedCursor;
     }
 
+    // timeline_data carries the EXPANDED segments under `segments` so Python receives
+    // the keyframes / prompts already split per cycle, plus the ORIGINAL segments
+    // under `_editorSegments` so a workflow round-trip restores the user's loopCount
+    // editing state. Both lists strip imgObj since it's a runtime-only DOM ref.
+    const stripImg = (s) => { const { imgObj, ...rest } = s; return rest; };
     const toSave = {
-      segments: sortedSegments.map(s => {
-        const { imgObj, ...rest } = s;
-        return rest;
-      }),
+      segments: expandedSegments.map(stripImg),
+      _editorSegments: sortedSegments.map(stripImg),
       audioSegments: (this.timeline.audioSegments || []).map(s => ({ ...s }))
     };
 
@@ -2895,7 +2945,7 @@ class TimelineEditor {
     }
 
     if (this.guideStrengthWidget) {
-      const imgStrengths = sortedSegments
+      const imgStrengths = expandedSegments
         .filter(s => s.type !== "text")
         .map(s => (s.guideStrength !== undefined ? s.guideStrength : 1.0).toFixed(2));
       this.guideStrengthWidget.value = imgStrengths.join(",");
@@ -2932,7 +2982,7 @@ class TimelineEditor {
         const x1 = (seg.start / totalFrames) * width;
         gaps.push({ track: 'image', frameStart: cursor, frameEnd: seg.start, centerX: (x0 + x1) / 2, centerY: RULER_HEIGHT + this.blockHeight / 2, widthPx: x1 - x0 });
       }
-      cursor = seg.start + seg.length;
+      cursor = seg.start + getEffectiveLength(seg);
     }
     if (cursor < outputFrames) {
       const x0 = (cursor / totalFrames) * width;
@@ -2990,7 +3040,7 @@ class TimelineEditor {
       clickedSeg = this.timeline.audioSegments.find(s => cursor >= s.start && cursor <= s.start + s.length);
       trackType = "audio";
     } else if (isImageTrack) {
-      clickedSeg = this.timeline.segments.find(s => cursor >= s.start && cursor <= s.start + s.length);
+      clickedSeg = this.timeline.segments.find(s => cursor >= s.start && cursor <= s.start + getEffectiveLength(s));
       trackType = clickedSeg ? clickedSeg.type : "";
     }
 
@@ -3665,7 +3715,7 @@ class TimelineEditor {
     let newStart = 0;
     for (const seg of sorted) {
       if (newStart + newLength <= seg.start) break;
-      newStart = Math.max(newStart, seg.start + seg.length);
+      newStart = Math.max(newStart, seg.start + getEffectiveLength(seg));
     }
     // Place the segment at the first free slot in the visual timeline (no output duration change).
     const durationFrames = this.getVisualDurationFrames();
