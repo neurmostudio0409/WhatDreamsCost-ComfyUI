@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.21.0**
+  * **Stitcher knob parity + simpler Smooth Video Stitcher.** `Smooth Video Stitcher` now takes `overlap_frames` + `blend_mode` (drop / linear / cosine) like the other stitchers, and its `positive`/`negative` inputs are gone — `model` + `clip` are now **optional** (leave them empty for a plain crossfade; connect both to also re-sample the seam with the model, with a blank no-prompt conditioning built from `clip`). `Smooth Audio Stitcher` gains a `drop` blend mode (trim the overlap, hard join) alongside cosine/linear/concat.
+
 **v1.20.0**
   * **New node: `Smooth Audio Stitcher`.** The audio counterpart to `Smooth Video Stitcher`. Connect your chunks' audio latents (4D `[B,C,T,F]`) to `latent_1..N` (slots grow as you wire them) and it **crossfades the overlap at each seam** (cosine/linear) so chained chunks' audio transitions smoothly instead of cutting. Pure crossfade — no model needed (an audio crossfade already sounds smooth, and LTX audio is sampled jointly with video so there is no standalone audio model to regenerate a seam with). Audio latents only — for video use `Smooth Video Stitcher`.
 

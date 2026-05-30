@@ -61,7 +61,7 @@ def _blend_overlap(left_tail, right_head, mode):
     return left_tail * (1.0 - alpha) + right_head * alpha
 
 
-def _concat_latents(latents, overlap_frames, blend_mode="drop"):
+def _concat_latents(latents, overlap_frames, blend_mode="drop", return_seams=False):
     """Stitch latent chunks along the temporal axis (dim=2).
 
     - blend_mode="drop":   drop the last `overlap_frames` of each preceding chunk
@@ -73,6 +73,9 @@ def _concat_latents(latents, overlap_frames, blend_mode="drop"):
     the seam consumes 2N source frames and emits N blended frames).
 
     Returns {"samples": stitched_tensor}. Per-chunk noise_mask keys are dropped.
+    If return_seams=True, returns (latent_dict, seam_frame_indices) where each
+    seam index is the join boundary between two emitted chunk regions in the
+    combined tensor (used by SmoothVideoStitcher to locate the bands to re-sample).
     """
     if not latents:
         raise ValueError("LongVideoStitcher: no latents to stitch.")
@@ -96,7 +99,14 @@ def _concat_latents(latents, overlap_frames, blend_mode="drop"):
             "[LongVideoStitcher] Concatenated %d audio latents -> %s",
             len(latents), tuple(combined.shape),
         )
-        return {"samples": combined, "type": latents[0].get("type", "audio")}
+        out = {"samples": combined, "type": latents[0].get("type", "audio")}
+        if return_seams:
+            seams, c = [], 0
+            for s in samples_list[:-1]:
+                c += s.shape[2]
+                seams.append(c)
+            return out, seams
+        return out
 
     # Sanity-check shapes match on B / C / H / W.
     for i, s in enumerate(samples_list[1:], start=1):
@@ -143,7 +153,15 @@ def _concat_latents(latents, overlap_frames, blend_mode="drop"):
         "[LongVideoStitcher] Stitched %d chunks with mode=%s overlap=%d -> %s",
         len(latents), blend_mode, overlap_frames, tuple(combined.shape),
     )
-    return {"samples": combined}
+    out = {"samples": combined}
+    if return_seams:
+        # Join boundaries = cumulative lengths of all emitted parts except the last.
+        seams, c = [], 0
+        for p in parts[:-1]:
+            c += p.shape[2]
+            seams.append(c)
+        return out, seams
+    return out
 
 
 _BLEND_MODES = ["drop", "linear", "cosine"]
@@ -229,20 +247,21 @@ class LongVideoStitcher(io.ComfyNode):
 
 
 class SmoothVideoStitcher(io.ComfyNode):
-    """Join video-latent chunks with MODEL-GENERATED transitions at each seam.
+    """Join video-latent chunks with a smooth seam — crossfade and/or MODEL re-gen.
 
-    Used like LongVideoStitcher — connect your chunk latents in order (latent_1..N
-    grow dynamically) — but instead of dropping/crossfading frames at the seam
-    (which reads as a cut or a dissolve) it concatenates the chunks and then
-    RE-SAMPLES a narrow band of `transition_frames` latent frames straddling every
-    seam with the diffusion model. The seam is therefore *generated* to flow from
-    one chunk into the next. Chunk interiors are locked (noise_mask = 0); only the
-    seam bands are denoised, so the rest of your video is untouched.
+    Used like LongVideoStitcher: connect chunk latents in order (latent_1..N grow
+    dynamically) and pick `overlap_frames` + `blend_mode` (drop / linear / cosine)
+    for the base seam blend.
 
-    Wire a PLAIN model + a simple positive/negative here — NOT a model already
-    patched with a prompt-relay mask built for a single chunk's latent shape (the
-    concatenated latent is longer). Video latents only (5D [B,C,T,H,W]); for audio
-    use LongVideoStitcher.
+    If you ALSO connect `model` + `clip`, the node then re-samples a narrow band of
+    `transition_frames` latent frames straddling every seam with the model, so the
+    boundary becomes a *generated* transition rather than just a crossfade. Chunk
+    interiors are locked (noise_mask = 0); only the seam bands are denoised. No
+    prompt is needed — a blank conditioning is built from `clip` internally.
+
+    If model/clip are left unconnected the node is a plain crossfade stitcher.
+    Use a PLAIN model (NOT one patched with a prompt-relay mask for a single
+    chunk's shape). Video latents only (5D); for audio use Smooth Audio Stitcher.
     """
 
     MAX_LATENTS = 12
@@ -259,23 +278,31 @@ class SmoothVideoStitcher(io.ComfyNode):
             display_name="Smooth Video Stitcher",
             category="WhatDreamsCost",
             description=(
-                "Concatenates video-latent chunks and regenerates a small band of frames at "
-                "each seam with the model, so the boundary is a generated transition instead "
-                "of a hard cut / dissolve. Connect chunks to latent_1..N (slots grow as you "
-                "wire them). Needs a plain model + positive/negative. Video latents only."
+                "Stitches video-latent chunks with a crossfade seam (overlap_frames + "
+                "blend_mode), and — if a model + clip are connected — re-samples a small "
+                "band at each seam with the model so the boundary is a generated transition "
+                "instead of a cut/dissolve. No prompt needed (blank conditioning from clip). "
+                "Connect chunks to latent_1..N (slots grow). Video latents only."
             ),
             inputs=[
-                io.Model.Input("model", tooltip="Plain diffusion model (NOT one patched with a prompt-relay mask for a single chunk's shape)."),
-                io.Conditioning.Input("positive", tooltip="Positive conditioning used to regenerate the seam frames (a simple scene/style prompt works well)."),
-                io.Conditioning.Input("negative", tooltip="Negative conditioning for the seam regeneration."),
                 *latent_inputs,
                 io.Int.Input(
+                    "overlap_frames", default=0, min=0, max=64, step=1, optional=True,
+                    tooltip="Latent frames consumed at each seam. drop = trimmed from each preceding chunk; linear/cosine = crossfade width (both sides contribute).",
+                ),
+                io.Combo.Input(
+                    "blend_mode", options=_BLEND_MODES, default="cosine", optional=True,
+                    tooltip="drop = hard cut (trim overlap). linear/cosine = crossfade the overlap. cosine is the smoothest base blend.",
+                ),
+                io.Model.Input("model", optional=True, tooltip="Optional. Connect to re-sample seam bands with the model (a generated transition). Use a PLAIN model, not one patched with a prompt-relay mask. Leave empty for crossfade-only."),
+                io.Clip.Input("clip", optional=True, tooltip="Optional. Required only when model is connected — used to build a blank (no-prompt) conditioning for the seam re-sampling."),
+                io.Int.Input(
                     "transition_frames", default=2, min=1, max=16, step=1, optional=True,
-                    tooltip="Latent frames regenerated on EACH side of every seam. Larger = longer, smoother transition (but more of the original boundary is replaced).",
+                    tooltip="(model re-gen) Latent frames regenerated on EACH side of every seam. Larger = longer transition.",
                 ),
                 io.Float.Input(
                     "denoise", default=0.7, min=0.0, max=1.0, step=0.01, optional=True,
-                    tooltip="How hard the seam band is regenerated. Higher = stronger, smoother bridge; lower = preserve more of the original concatenated frames.",
+                    tooltip="(model re-gen) How hard the seam band is regenerated. Higher = stronger bridge; lower = preserve more of the crossfaded frames.",
                 ),
                 io.Int.Input("steps", default=20, min=1, max=200, step=1, optional=True),
                 io.Float.Input("cfg", default=3.0, min=0.0, max=20.0, step=0.1, optional=True),
@@ -283,7 +310,7 @@ class SmoothVideoStitcher(io.ComfyNode):
                 io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="normal", optional=True),
                 io.Int.Input(
                     "seed", default=0, min=0, max=0xffffffffffffffff, optional=True,
-                    tooltip="Seed for the seam regeneration.",
+                    tooltip="Seed for the seam re-sampling.",
                 ),
             ],
             outputs=[
@@ -292,9 +319,10 @@ class SmoothVideoStitcher(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, positive, negative, latent_1, latent_2=None, latent_3=None,
-                latent_4=None, latent_5=None, latent_6=None, latent_7=None, latent_8=None,
+    def execute(cls, latent_1, latent_2=None, latent_3=None, latent_4=None,
+                latent_5=None, latent_6=None, latent_7=None, latent_8=None,
                 latent_9=None, latent_10=None, latent_11=None, latent_12=None,
+                overlap_frames=0, blend_mode="cosine", model=None, clip=None,
                 transition_frames=2, denoise=0.7, steps=20, cfg=3.0,
                 sampler_name="euler", scheduler="normal", seed=0) -> io.NodeOutput:
         ordered = [latent_1, latent_2, latent_3, latent_4, latent_5, latent_6,
@@ -302,56 +330,45 @@ class SmoothVideoStitcher(io.ComfyNode):
         chunks = [l for l in ordered if l is not None]
         if not chunks:
             raise ValueError("SmoothVideoStitcher: no latents to stitch.")
-
-        samples_list = [l["samples"] for l in chunks]
-        ref = samples_list[0]
-        if ref.dim() != 5:
+        if chunks[0]["samples"].dim() != 5:
             raise ValueError(
                 f"SmoothVideoStitcher: expected 5D video latents [B,C,T,H,W], got shape "
-                f"{tuple(ref.shape)}. (For audio latents use LongVideoStitcher.)"
+                f"{tuple(chunks[0]['samples'].shape)}. (For audio use Smooth Audio Stitcher.)"
             )
-        for i, s in enumerate(samples_list[1:], start=1):
-            if (s.shape[0], s.shape[1], s.shape[3], s.shape[4]) != \
-               (ref.shape[0], ref.shape[1], ref.shape[3], ref.shape[4]):
-                raise ValueError(
-                    f"SmoothVideoStitcher: chunk {i + 1} shape {tuple(s.shape)} does not match "
-                    f"chunk 1 {tuple(ref.shape)} (batch / channels / spatial dims must agree)."
-                )
 
-        # A single chunk has no seam to smooth — pass it straight through.
-        if len(samples_list) == 1:
-            return io.NodeOutput(chunks[0])
+        # Base stitch (crossfade / drop) + the seam join positions.
+        base, seams = _concat_latents(chunks, int(overlap_frames), blend_mode, return_seams=True)
 
-        combined = torch.cat(samples_list, dim=2)
+        # Crossfade-only when no model/clip, or nothing to bridge.
+        if model is None or clip is None or not seams:
+            return io.NodeOutput(base)
+
+        combined = base["samples"]
         total_t = combined.shape[2]
-
-        # Seam positions = cumulative chunk boundaries (first frame index of each
-        # following chunk). The regeneration band spans transition_frames on each side.
         tf = max(1, int(transition_frames))
         # noise_mask: 1 = regenerate (the seam bands), 0 = preserve (chunk interiors).
         mask = torch.zeros(
             (combined.shape[0], 1, total_t, 1, 1),
             dtype=combined.dtype, device=combined.device,
         )
-        cursor = 0
-        seams = []
-        for s in samples_list[:-1]:
-            cursor += s.shape[2]
-            seams.append(cursor)
-            lo = max(0, cursor - tf)
-            hi = min(total_t, cursor + tf)
+        for seam in seams:
+            lo = max(0, seam - tf)
+            hi = min(total_t, seam + tf)
             mask[:, :, lo:hi] = 1.0
+
+        # Blank (no-prompt) conditioning so the seam is just smoothed, not steered.
+        empty = clip.encode_from_tokens_scheduled(clip.tokenize(""))
 
         log.info(
             "[SmoothVideoStitcher] %d chunks -> %d latent frames, %d seam(s) at %s, "
             "regen band=%d each side, denoise=%.2f",
-            len(samples_list), total_t, len(seams), seams, tf, float(denoise),
+            len(chunks), total_t, len(seams), seams, tf, float(denoise),
         )
 
         latent = {"samples": combined, "noise_mask": mask}
         sampled = nodes.common_ksampler(
             model, int(seed), int(steps), float(cfg), sampler_name, scheduler,
-            positive, negative, latent, denoise=float(denoise),
+            empty, empty, latent, denoise=float(denoise),
         )[0]
         return io.NodeOutput({"samples": sampled["samples"]})
 
@@ -361,8 +378,9 @@ def _concat_audio_latents(latents, overlap_frames, blend_mode="cosine"):
 
     blend_mode "cosine"/"linear" crossfades the trailing `overlap_frames` of each
     preceding chunk with the leading `overlap_frames` of the next (both sides are
-    consumed, one blended span is emitted) so the seam fades smoothly. "concat"
-    just butts the chunks together (the old LongVideoStitcher audio behaviour).
+    consumed, one blended span is emitted) so the seam fades smoothly. "drop" trims
+    the trailing `overlap_frames` from each preceding chunk (a hard join with no
+    fade). "concat" just butts the chunks together (no trim, no fade).
     """
     if not latents:
         raise ValueError("SmoothAudioStitcher: no latents to stitch.")
@@ -387,6 +405,14 @@ def _concat_audio_latents(latents, overlap_frames, blend_mode="cosine"):
 
     if overlap_frames <= 0 or blend_mode == "concat":
         combined = torch.cat(samples_list, dim=2)
+    elif blend_mode == "drop":
+        # Trim trailing overlap_frames from every chunk except the last (hard join).
+        parts = []
+        for i, s in enumerate(samples_list):
+            if i < len(samples_list) - 1 and s.shape[2] > overlap_frames:
+                s = s[:, :, :-overlap_frames]
+            parts.append(s)
+        combined = torch.cat(parts, dim=2)
     else:
         parts = [samples_list[0]]
         for i in range(1, len(samples_list)):
@@ -413,7 +439,7 @@ def _concat_audio_latents(latents, overlap_frames, blend_mode="cosine"):
     return {"samples": combined, "type": out_type}
 
 
-_AUDIO_BLEND_MODES = ["cosine", "linear", "concat"]
+_AUDIO_BLEND_MODES = ["cosine", "linear", "drop", "concat"]
 
 
 class SmoothAudioStitcher(io.ComfyNode):
@@ -456,7 +482,7 @@ class SmoothAudioStitcher(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "blend_mode", options=_AUDIO_BLEND_MODES, default="cosine", optional=True,
-                    tooltip="cosine = smooth eased crossfade (best). linear = constant-rate crossfade. concat = just butt the chunks together (no fade).",
+                    tooltip="cosine = smooth eased crossfade (best). linear = constant-rate crossfade. drop = trim overlap from each preceding chunk (hard join, no fade). concat = just butt the chunks together (no trim, no fade).",
                 ),
             ],
             outputs=[
