@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.18.0**
+  * **Removed the image-segment Loop / repeat feature.** The per-segment `Loop` count (the `×N` badge + dashed cycle separators that held one image across N back-to-back cycles) is gone from the timeline UI and from the LTX / Wan backends. To hold an image for longer, just drag its segment edge to the length you want. Old saved workflows still load — any stored `loopCount` is simply ignored (the segment plays once at its base length).
+
 **v1.17.0**
   * **Fixed `prev_latent` auto-chaining (LTX & Wan Director).** Chaining now decodes the previous chunk's **last frame** and uses it as the next chunk's frame-0 start keyframe — exactly what wiring `Latent Tail to Image → start_image` by hand produces. The v1.13.0 "multi-frame motion clip" path could silently fail when the downstream guide was applied (the build error was swallowed), so `prev_latent` appeared to do nothing; the build error is now logged with a full traceback instead of hidden.
   * **Cleanup — fewer, less redundant nodes.** Removed `Long Chunk Sampler` and `Long Chunk Sampler (Multi-Prompt)`, which were both subsumed by **`Long Chain Sampler (Dynamic)`** (one prompt per line, `num_chunks` sets the count — a single prompt + `num_chunks=N` reproduces the old single-prompt sampler, and the multiline list replaces the 6-socket multi-prompt one with no cap). Also reverted the experimental chained-timeline "lead-in ghost" UI overlay and dropped a dead `WanAnimateDirector` flag. **Note:** if you have a saved workflow using the two removed sampler nodes, swap them for `Long Chain Sampler (Dynamic)`.

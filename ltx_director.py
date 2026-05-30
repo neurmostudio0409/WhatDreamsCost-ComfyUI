@@ -583,23 +583,10 @@ class LTXDirector(io.ComfyNode):
                     derived_h = tensor.shape[1]
                     derived_w = tensor.shape[2]
 
-                # Loop count → "single keyframe held for length × loopCount pixel frames".
-                # We only replicate to 9 pixel frames here (LTX VAE's smallest non-trivial
-                # window: 1 + 8 = 9 → 2 latent frames). The LTXDirectorGuide node duplicates
-                # the second latent frame at sample time to fill the rest of the hold,
-                # avoiding a giant VAE encode for long holds (e.g. 40 s × 24 fps = 961 frames).
-                loop_count = max(1, int(seg.get("loopCount", 1)))
-                base_length = max(1, int(seg.get("length", 1)))
-                hold_pixel_frames = 1
-                if loop_count > 1:
-                    hold_pixel_frames = base_length * loop_count
-                    tensor = tensor.repeat(9, 1, 1, 1)
-
                 strength = strengths[idx] if idx < len(strengths) else 1.0
                 guide_data["images"].append(tensor)
                 guide_data["insert_frames"].append(int(seg["start"]))
                 guide_data["strengths"].append(float(strength))
-                guide_data.setdefault("hold_pixel_frames", []).append(hold_pixel_frames)
 
             # start_image: inject the previous chunk's tail frame as a hard frame-0 keyframe so
             # this chunk continues seamlessly from where the last one ended. Prepended to the
@@ -612,7 +599,6 @@ class LTXDirector(io.ComfyNode):
                 guide_data["images"].insert(0, start_tensor)
                 guide_data["insert_frames"].insert(0, 0)
                 guide_data["strengths"].insert(0, float(start_image_strength))
-                guide_data.setdefault("hold_pixel_frames", []).insert(0, 1)
 
             # If no images were loaded from the timeline, create a dummy image at strength 0
             # to prevent artifacts in text-to-video mode.

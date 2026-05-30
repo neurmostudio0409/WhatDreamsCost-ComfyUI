@@ -543,15 +543,6 @@ const ICONS = {
 
 // --- Data Models ---
 
-// Image segments support a loopCount > 1, meaning the segment is repeated N times
-// back-to-back. The base `seg.length` is the cycle length; effective length on the
-// timeline is length * loopCount. Audio and text segments don't loop.
-function getEffectiveLength(seg) {
-  if (!seg) return 0;
-  const loop = parseInt(seg.loopCount, 10) || 1;
-  if (seg.type === "text" || loop <= 1) return seg.length;
-  return seg.length * loop;
-}
 
 function parseInitial(jsonStr) {
   let parsed = { segments: [], audioSegments: [] };
@@ -780,7 +771,7 @@ class TimelineEditor {
   getVisualDurationFrames() {
     let furthest = 0;
     for (const seg of this.timeline.segments) {
-      furthest = Math.max(furthest, seg.start + getEffectiveLength(seg));
+      furthest = Math.max(furthest, seg.start + seg.length);
     }
     for (const seg of this.timeline.audioSegments) {
       furthest = Math.max(furthest, seg.start + seg.length);
@@ -1362,75 +1353,6 @@ class TimelineEditor {
     this.strengthRow.appendChild(strengthLabel);
     this.strengthRow.appendChild(this.strengthValue);
 
-    // --- Loop Count input (image segments only) ---
-    const loopLabel = document.createElement("span");
-    loopLabel.className = "pr-strength-label";
-    loopLabel.textContent = "Loop:";
-    loopLabel.style.marginLeft = "12px";
-
-    this.loopValue = document.createElement("input");
-    this.loopValue.type = "text";
-    this.loopValue.className = "pr-strength-input";
-    this.loopValue.value = "1";
-    this.loopValue.disabled = true;
-    this.loopValue.style.cursor = "ew-resize";
-    this.loopValue.title = "How many times this image segment is repeated back-to-back on the timeline (1 = no repeat; 5 = the segment occupies 5× its base length, with the same image inserted as a keyframe at each cycle boundary).";
-
-    let loopDragging = false;
-    let loopStartX = 0;
-    let loopStartVal = 1;
-    let loopMoved = false;
-
-    this.loopValue.addEventListener("mousedown", (e) => {
-      if (this.loopValue.disabled) return;
-      loopStartX = e.clientX;
-      loopStartVal = parseInt(this.loopValue.value, 10) || 1;
-      loopMoved = false;
-
-      const onMove = (mv) => {
-        const dx = mv.clientX - loopStartX;
-        if (Math.abs(dx) > 3) { loopMoved = true; loopDragging = true; }
-        if (loopDragging) {
-          mv.preventDefault();
-          let v = Math.round(loopStartVal + dx * 0.05);
-          v = Math.max(1, Math.min(100, v));
-          this.loopValue.value = String(v);
-          if (this.selectionType === "image" && this.timeline.segments[this.selectedIndex]) {
-            const seg = this.timeline.segments[this.selectedIndex];
-            if (seg.type !== "text") {
-              this.applyLoopCountChange(seg, v);
-              this.commitChanges();
-            }
-          }
-        }
-      };
-      const onUp = () => {
-        document.removeEventListener("mousemove", onMove);
-        document.removeEventListener("mouseup", onUp);
-        if (!loopMoved) { this.loopValue.focus(); this.loopValue.select(); }
-        loopDragging = false;
-      };
-      document.addEventListener("mousemove", onMove);
-      document.addEventListener("mouseup", onUp);
-    });
-
-    this.loopValue.addEventListener("change", (e) => {
-      let v = parseInt(e.target.value, 10);
-      if (isNaN(v)) v = 1;
-      v = Math.max(1, Math.min(100, v));
-      this.loopValue.value = String(v);
-      if (this.selectionType === "image" && this.timeline.segments[this.selectedIndex]) {
-        const seg = this.timeline.segments[this.selectedIndex];
-        if (seg.type !== "text") {
-          this.applyLoopCountChange(seg, v);
-          this.commitChanges();
-        }
-      }
-    });
-
-    this.strengthRow.appendChild(loopLabel);
-    this.strengthRow.appendChild(this.loopValue);
-
 
     this.wrapper.appendChild(toolbar);
     this.wrapper.appendChild(this.viewport);
@@ -1529,7 +1451,7 @@ class TimelineEditor {
               for (let i = 0; i < this.timeline.segments.length; i++) {
                 let seg = this.timeline.segments[i];
                 if (newStart + newLength <= seg.start) break;
-                newStart = Math.max(newStart, seg.start + getEffectiveLength(seg));
+                newStart = Math.max(newStart, seg.start + seg.length);
               }
             }
 
@@ -1789,7 +1711,6 @@ class TimelineEditor {
       `;
       this.strengthValue.value = "1.00";
       this.strengthValue.disabled = true;
-      if (this.loopValue) { this.loopValue.value = "1"; this.loopValue.disabled = true; }
     } else {
       this.audioInfoArea.style.display = "none";
       this.promptInput.style.display = "block";
@@ -1803,23 +1724,18 @@ class TimelineEditor {
         const strength = isImage ? (seg.guideStrength ?? 1.0) : 1.0;
         this.strengthValue.value = strength.toFixed(2);
         this.strengthValue.disabled = !isImage;
-        if (this.loopValue) {
-          this.loopValue.value = String(isImage ? (seg.loopCount ?? 1) : 1);
-          this.loopValue.disabled = !isImage;
-        }
       } else {
         this.promptInput.value = "";
         this.promptInput.disabled = true;
         this.strengthValue.value = "1.00";
         this.strengthValue.disabled = true;
-        if (this.loopValue) { this.loopValue.value = "1"; this.loopValue.disabled = true; }
       }
     }
 
     if (this.segmentBoundsDisplay) {
       if (seg) {
         const startStr = this.formatTime(seg.start, true);
-        const endFrame = (this.selectionType === "image") ? seg.start + getEffectiveLength(seg) : seg.start + seg.length;
+        const endFrame = seg.start + seg.length;
         const endStr = this.formatTime(endFrame, true);
         this.segmentBoundsDisplay.textContent = `Start: ${startStr} | End: ${endStr}`;
       } else {
@@ -1884,7 +1800,7 @@ class TimelineEditor {
     for (let i = 0; i < sortedSegments.length; i++) {
       const seg = sortedSegments[i];
       const startX = (seg.start / totalFrames) * width;
-      const pxWidth = (getEffectiveLength(seg) / totalFrames) * width;
+      const pxWidth = (seg.length / totalFrames) * width;
       const isSelected = (this.selectionType === "image" && seg.id === activeSegId);
 
       const originalSeg = this.timeline.segments.find(s => s.id === seg.id);
@@ -2036,52 +1952,6 @@ class TimelineEditor {
         }
       }
 
-      // --- Loop cycle separators + ×N badge (image segments with loopCount > 1) ---
-      const loopCount = (seg.type !== "text" && seg.type !== "ghost")
-        ? Math.max(1, parseInt(seg.loopCount, 10) || 1) : 1;
-      if (loopCount > 1) {
-        // Dashed vertical separators between cycles
-        const cycleWidth = pxWidth / loopCount;
-        this.ctx.save();
-        this.ctx.strokeStyle = "rgba(255, 255, 255, 0.55)";
-        this.ctx.lineWidth = 1;
-        this.ctx.setLineDash([4, 3]);
-        for (let c = 1; c < loopCount; c++) {
-          const sx = startX + cycleWidth * c;
-          this.ctx.beginPath();
-          this.ctx.moveTo(sx, RULER_HEIGHT + 2);
-          this.ctx.lineTo(sx, RULER_HEIGHT + this.blockHeight - 2);
-          this.ctx.stroke();
-        }
-        this.ctx.setLineDash([]);
-        this.ctx.restore();
-
-        // ×N badge at top-right corner
-        const badgeText = "×" + loopCount;
-        this.ctx.save();
-        this.ctx.font = "bold 11px sans-serif";
-        const padX = 5;
-        const padY = 2;
-        const textW = this.ctx.measureText(badgeText).width;
-        const badgeW = textW + padX * 2;
-        const badgeH = 16;
-        const badgeX = startX + pxWidth - badgeW - 4;
-        const badgeY = RULER_HEIGHT + 4;
-        if (badgeX > startX + 2) {
-          this.ctx.fillStyle = "rgba(0, 0, 0, 0.78)";
-          this.ctx.strokeStyle = "rgba(255, 255, 255, 0.45)";
-          this.ctx.lineWidth = 1;
-          this.ctx.beginPath();
-          this.ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
-          this.ctx.fill();
-          this.ctx.stroke();
-          this.ctx.fillStyle = "#ffd479";
-          this.ctx.textAlign = "center";
-          this.ctx.textBaseline = "middle";
-          this.ctx.fillText(badgeText, badgeX + badgeW / 2, badgeY + badgeH / 2 + 0.5);
-        }
-        this.ctx.restore();
-      }
 
       if (isSelected) {
         this.ctx.strokeStyle = "#fff";
@@ -2408,27 +2278,24 @@ class TimelineEditor {
       .sort((a, b) => a.start - b.start);
 
     const HANDLE_CORE = 4;
-    // For image segments the effective end is start + length * loopCount. Audio
-    // segments don't loop so effective length == length.
-    const effLen = (s) => trackType === "image" ? getEffectiveLength(s) : s.length;
 
     for (let i = 0; i < sortedSegments.length; i++) {
       const seg = sortedSegments[i];
       const startX = (seg.start / totalFrames) * width;
-      const pxWidth = (effLen(seg) / totalFrames) * width;
+      const pxWidth = (seg.length / totalFrames) * width;
       const endX = startX + pxWidth;
 
       const prevSeg = sortedSegments[i - 1];
       const nextSeg = sortedSegments[i + 1];
 
-      const isLeftJoint = prevSeg && prevSeg.start + effLen(prevSeg) === seg.start;
+      const isLeftJoint = prevSeg && prevSeg.start + prevSeg.length === seg.start;
       if (!isLeftJoint) {
         if (Math.abs(mouseX - startX) <= HANDLE_HIT_PX) {
           return { type: "edge", index: seg.originalIndex, dir: "left", track: trackType };
         }
       }
 
-      const isRightJoint = nextSeg && nextSeg.start === seg.start + effLen(seg);
+      const isRightJoint = nextSeg && nextSeg.start === seg.start + seg.length;
       if (isRightJoint) {
         const dx = mouseX - endX;
         if (Math.abs(dx) <= HANDLE_HIT_PX) {
@@ -2450,7 +2317,7 @@ class TimelineEditor {
     for (let i = 0; i < sortedSegments.length; i++) {
       const seg = sortedSegments[i];
       const startX = (seg.start / totalFrames) * width;
-      const pxWidth = (effLen(seg) / totalFrames) * width;
+      const pxWidth = (seg.length / totalFrames) * width;
       const endX = startX + pxWidth;
 
       if (mouseX >= startX && mouseX < endX) {
@@ -2903,54 +2770,6 @@ class TimelineEditor {
   }
 
   // --- Backend Data Sync ---
-  // Change a segment's loopCount and shift every later segment (image + audio)
-  // by the delta so the looped segment doesn't overwrite its neighbours. For
-  // shrinking the loop, we clamp at the new effective end to avoid overlapping
-  // the looped segment itself. No-op when the value doesn't change.
-  applyLoopCountChange(seg, newLoop) {
-    const oldLoop = Math.max(1, parseInt(seg.loopCount, 10) || 1);
-    newLoop = Math.max(1, parseInt(newLoop, 10) || 1);
-    if (newLoop === oldLoop) {
-      seg.loopCount = newLoop;
-      return;
-    }
-
-    const delta = (newLoop - oldLoop) * seg.length;
-    const oldEnd = seg.start + seg.length * oldLoop;
-    const newEnd = seg.start + seg.length * newLoop;
-
-    const shiftList = (list) => {
-      if (!Array.isArray(list)) return;
-      for (const other of list) {
-        if (other.id === seg.id) continue;
-        if (other.start >= oldEnd) {
-          other.start = Math.max(newEnd, other.start + delta);
-        }
-      }
-    };
-    shiftList(this.timeline.segments);
-    shiftList(this.timeline.audioSegments);
-
-    seg.loopCount = newLoop;
-
-    // Grow duration_frames to cover the new effective end of every segment so the
-    // commitChanges cutoff doesn't silently drop the segments we just shifted out.
-    // We never shrink — that's the user's call.
-    let maxEnd = 0;
-    for (const s of this.timeline.segments) {
-      maxEnd = Math.max(maxEnd, s.start + getEffectiveLength(s));
-    }
-    for (const s of this.timeline.audioSegments) {
-      maxEnd = Math.max(maxEnd, s.start + s.length);
-    }
-    if (this.durationFramesWidget && maxEnd > this.getDurationFrames()) {
-      this.durationFramesWidget.value = maxEnd;
-      if (this.durationFramesWidget.callback) {
-        this.durationFramesWidget.callback(maxEnd);
-      }
-    }
-  }
-
   commitChanges(skipRender = false) {
     let sortedSegments = [...this.timeline.segments].sort((a, b) => a.start - b.start);
 
@@ -2964,9 +2783,6 @@ class TimelineEditor {
     //   segment's length (same as before), but are also clipped at durationFrames.
     // - Segments that start at or past the cutoff are excluded entirely.
     // - Segments that cross the cutoff are trimmed so their end = durationFrames exactly.
-    // For image segments with loopCount > 1 we use the effective length (length * loopCount)
-    // so the prompt-relay schedules the prompt for the whole held span — Python emits a
-    // single keyframe per segment but holds the image for the full effective length.
     let pendingGap = 0;
     for (let seg of sortedSegments) {
       // Skip segments entirely outside the duration.
@@ -2982,14 +2798,13 @@ class TimelineEditor {
         }
       }
 
-      const segEffective = getEffectiveLength(seg);
-      const clippedEnd = Math.min(seg.start + segEffective, durationFrames);
+      const clippedEnd = Math.min(seg.start + seg.length, durationFrames);
       const clippedLength = clippedEnd - seg.start;
 
       contiguousLengths.push(clippedLength + pendingGap);
       contiguousPrompts.push(seg.prompt || "");
       pendingGap = 0;
-      currentCursor = seg.start + segEffective;
+      currentCursor = seg.start + seg.length;
     }
 
     // If segments don't fill to the end of the duration, pad the last segment to reach it.
@@ -2998,12 +2813,8 @@ class TimelineEditor {
       contiguousLengths[contiguousLengths.length - 1] += durationFrames - clampedCursor;
     }
 
-    // timeline_data carries the ORIGINAL segments (with loopCount preserved) — Python
-    // reads `loopCount` and replicates each image into a length * loopCount frame held
-    // chunk before the VAE encode, producing one smooth multi-frame keyframe rather
-    // than N separate keyframes (which caused colour shifts / discontinuity at every
-    // cycle boundary). imgObj is stripped (DOM-only). _editorSegments is kept as an
-    // alias for backward compatibility with workflows saved on v1.5.0..v1.5.1.
+    // timeline_data carries the segments for the backend. imgObj is stripped (DOM-only).
+    // _editorSegments is kept as an alias for backward compatibility with older saves.
     const stripImg = (s) => { const { imgObj, ...rest } = s; return rest; };
     const savedSegments = sortedSegments.map(stripImg);
     const toSave = {
@@ -3060,7 +2871,7 @@ class TimelineEditor {
         const x1 = (seg.start / totalFrames) * width;
         gaps.push({ track: 'image', frameStart: cursor, frameEnd: seg.start, centerX: (x0 + x1) / 2, centerY: RULER_HEIGHT + this.blockHeight / 2, widthPx: x1 - x0 });
       }
-      cursor = seg.start + getEffectiveLength(seg);
+      cursor = seg.start + seg.length;
     }
     if (cursor < outputFrames) {
       const x0 = (cursor / totalFrames) * width;
@@ -3118,7 +2929,7 @@ class TimelineEditor {
       clickedSeg = this.timeline.audioSegments.find(s => cursor >= s.start && cursor <= s.start + s.length);
       trackType = "audio";
     } else if (isImageTrack) {
-      clickedSeg = this.timeline.segments.find(s => cursor >= s.start && cursor <= s.start + getEffectiveLength(s));
+      clickedSeg = this.timeline.segments.find(s => cursor >= s.start && cursor <= s.start + s.length);
       trackType = clickedSeg ? clickedSeg.type : "";
     }
 
@@ -3793,7 +3604,7 @@ class TimelineEditor {
     let newStart = 0;
     for (const seg of sorted) {
       if (newStart + newLength <= seg.start) break;
-      newStart = Math.max(newStart, seg.start + getEffectiveLength(seg));
+      newStart = Math.max(newStart, seg.start + seg.length);
     }
     // Place the segment at the first free slot in the visual timeline (no output duration change).
     const durationFrames = this.getVisualDurationFrames();

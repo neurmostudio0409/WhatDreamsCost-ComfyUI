@@ -409,18 +409,6 @@ class WanDirector(io.ComfyNode):
         def _load_seg(seg):
             t = _load_image_tensor(seg)
             t = _resize_and_normalize(t, tgt_w, tgt_h, divisible_by, resize_method)
-            # Loop count → hold the same image for length × loopCount pixel frames so
-            # WanImageToVideo / FLF masks it for that whole span. Wan's VAE temporal
-            # stride is 4, so we snap up to (4n+1). The hold cannot exceed the model
-            # output length, so we clamp; users wanting a hold longer than `length`
-            # need to chain multiple Director calls.
-            loop_count = max(1, int(seg.get("loopCount", 1)))
-            if loop_count > 1:
-                base_length = max(1, int(seg.get("length", 1)))
-                target = base_length * loop_count
-                target = ((target + 2) // 4) * 4 + 1
-                target = max(1, min(target, length))
-                t = t.repeat(target, 1, 1, 1)
             return t
 
         start_image = _load_seg(img_segs[0]) if len(img_segs) >= 1 else None
