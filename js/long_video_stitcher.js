@@ -13,7 +13,7 @@ import { app } from "../../scripts/app.js";
 const MAX_LATENTS = 12;
 const MIN_VISIBLE = 2; // always show at least latent_1 + one spare
 // Nodes that expose dynamic latent_1..latent_12 inputs.
-const DYNAMIC_LATENT_NODES = ["LongVideoStitcher", "SmoothVideoStitcher", "SmoothAudioStitcher"];
+const DYNAMIC_LATENT_NODES = ["LongVideoStitcher", "SmoothVideoStitcher", "SmoothAudioStitcher", "LTXSmoothTransition"];
 
 function latentIndex(name) {
     const m = /^latent_(\d+)$/.exec(name || "");

@@ -5,7 +5,7 @@ from .speech_length_calculator import SpeechLengthCalculator
 from .load_audio_ui import LoadAudioUI
 from .load_video_ui import LoadVideoUI
 from .ltx_director import LTXDirector
-from .ltx_director_guide import LTXDirectorGuide
+from .ltx_director_guide import LTXDirectorGuide, LTXSmoothTransition
 from .wan_director import WanDirector, WanS2VDirector, WanVaceDirector, WanAnimateDirector
 from .long_video_stitcher import (
     LongVideoStitcher,
@@ -31,6 +31,7 @@ class PromptRelay(ComfyExtension):
             LongVideoStitcher,
             SmoothVideoStitcher,
             SmoothAudioStitcher,
+            LTXSmoothTransition,
             LatentTailToImage,
             LongChainSampler,
             LightningLoraPreset,
@@ -48,6 +49,7 @@ NODE_CLASS_MAPPINGS = {
     "LoadVideoUI": LoadVideoUI,
     "LTXDirector": LTXDirector,
     "LTXDirectorGuide": LTXDirectorGuide,
+    "LTXSmoothTransition": LTXSmoothTransition,
     "WanDirector": WanDirector,
     "WanS2VDirector": WanS2VDirector,
     "WanVaceDirector": WanVaceDirector,
@@ -69,6 +71,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadVideoUI": "Load Video UI",
     "LTXDirector": "LTX Director",
     "LTXDirectorGuide": "LTX Director Guide",
+    "LTXSmoothTransition": "LTX Smooth Transition",
     "WanDirector": "Wan Director",
     "WanS2VDirector": "Wan S2V Director",
     "WanVaceDirector": "Wan VACE Director",

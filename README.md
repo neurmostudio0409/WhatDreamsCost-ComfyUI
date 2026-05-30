@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.22.0**
+  * **New node: `LTX Smooth Transition` — native-FLF-smooth joins.** Stitchers can only crossfade/dissolve two already-finished chunks (the boundaries are fixed and incompatible). This node instead **generates** the join: for every adjacent pair it decodes chunk *i*'s last frame and chunk *i+1*'s first frame, treats them as the first/last keyframes of a fresh latent, and samples a real First-Last-Frame morph, splicing the result in as `[chunk 1][generated transition][chunk 2]...`. Because the model plans coherent motion across each transition, the joins are as smooth as a native FLF clip. Connect chunks to `latent_1..N` (slots grow) plus the LTX `model` + `vae` + `clip`; tune `transition_frames` (length of each generated bridge) and an optional `prompt`. LTX video latents only.
+
 **v1.21.0**
   * **Stitcher knob parity + simpler Smooth Video Stitcher.** `Smooth Video Stitcher` now takes `overlap_frames` + `blend_mode` (drop / linear / cosine) like the other stitchers, and its `positive`/`negative` inputs are gone — `model` + `clip` are now **optional** (leave them empty for a plain crossfade; connect both to also re-sample the seam with the model, with a blank no-prompt conditioning built from `clip`). `Smooth Audio Stitcher` gains a `drop` blend mode (trim the overlap, hard join) alongside cosine/linear/concat.
 
