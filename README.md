@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.14.0**
+  * **`Long Video Stitcher` — dynamic latent inputs.** The latent input slots now grow as you connect chunks (and shrink when you disconnect), up to 12. Connect as many chunks as you need without pre-wiring empty slots. Audio latents still work (a second instance for the audio track).
+
 **v1.13.0**
   * **Smoother seams — chained chunks no longer stutter.** Auto-chaining (LTX & Wan `prev_latent`) now carries a short **motion clip** (the last couple of latent frames) across the seam instead of a single still frame, so the model continues the existing motion rather than restarting from a standstill. The `2x30s Chain` example also switches the stitch to `drop` mode (no static-vs-moving crossfade). Tune `overlap_frames` on the stitcher and `_CHAIN_TAIL_LATENT_FRAMES` (in `ltx_director.py`) if a seam still needs work.
   * **New node: `Long Chain Sampler (Dynamic)`.** Set `num_chunks=N` and give one prompt per line — it samples N chunks in a single node (each seeded from the previous chunk's tail) and stitches them into one latent. The chunk count is not capped by input sockets, and `num_chunks=0` means "one chunk per prompt line". This is the fast single-stage path; for the LTX 2-stage upscale quality, chain Directors with `prev_latent` instead.

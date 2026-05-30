@@ -159,14 +159,25 @@ class LongVideoStitcher(io.ComfyNode):
     latent frames) is usually enough to hide the boundary.
     """
 
+    # Max number of latent input slots. The JS extension (js/long_video_stitcher.js)
+    # grows/shrinks the *visible* slots dynamically as you connect chunks; the backend
+    # just needs every possible slot declared, so connect as many as you need up to this.
+    MAX_LATENTS = 12
+
     @classmethod
     def define_schema(cls):
+        latent_inputs = [io.Latent.Input("latent_1", tooltip="First chunk (required).")]
+        for i in range(2, cls.MAX_LATENTS + 1):
+            latent_inputs.append(
+                io.Latent.Input(f"latent_{i}", optional=True, tooltip=f"Chunk {i} (optional).")
+            )
         return io.Schema(
             node_id="LongVideoStitcher",
             display_name="Long Video Stitcher",
             category="WhatDreamsCost",
             description=(
-                "Concatenates up to 6 video latents along the temporal axis. "
+                f"Concatenates up to {cls.MAX_LATENTS} video latents along the temporal axis "
+                "(connect as many as you need — the input slots grow dynamically). "
                 "blend_mode=drop trims the trailing overlap_frames of each preceding "
                 "chunk; blend_mode=linear/cosine crossfades the overlap region across "
                 "each seam for a smoother boundary. Channels / spatial dims of all "
@@ -175,12 +186,7 @@ class LongVideoStitcher(io.ComfyNode):
                 "you can stitch the matching audio of chained chunks with a second instance."
             ),
             inputs=[
-                io.Latent.Input("latent_1", tooltip="First chunk (required)."),
-                io.Latent.Input("latent_2", optional=True, tooltip="Second chunk."),
-                io.Latent.Input("latent_3", optional=True, tooltip="Third chunk."),
-                io.Latent.Input("latent_4", optional=True, tooltip="Fourth chunk."),
-                io.Latent.Input("latent_5", optional=True, tooltip="Fifth chunk."),
-                io.Latent.Input("latent_6", optional=True, tooltip="Sixth chunk."),
+                *latent_inputs,
                 io.Int.Input(
                     "overlap_frames", default=0, min=0, max=64, step=1, optional=True,
                     tooltip=(
@@ -208,10 +214,13 @@ class LongVideoStitcher(io.ComfyNode):
 
     @classmethod
     def execute(cls, latent_1, latent_2=None, latent_3=None, latent_4=None,
-                latent_5=None, latent_6=None, overlap_frames=0,
-                blend_mode="drop") -> io.NodeOutput:
-        chunks = [l for l in (latent_1, latent_2, latent_3, latent_4, latent_5, latent_6)
-                  if l is not None]
+                latent_5=None, latent_6=None, latent_7=None, latent_8=None,
+                latent_9=None, latent_10=None, latent_11=None, latent_12=None,
+                overlap_frames=0, blend_mode="drop") -> io.NodeOutput:
+        # Collect latent_1..latent_12 in order, keeping only the connected ones.
+        ordered = [latent_1, latent_2, latent_3, latent_4, latent_5, latent_6,
+                   latent_7, latent_8, latent_9, latent_10, latent_11, latent_12]
+        chunks = [l for l in ordered if l is not None]
         out = _concat_latents(chunks, int(overlap_frames), blend_mode)
         return io.NodeOutput(out)
 
