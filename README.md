@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.16.0**
+  * **Chained Director timeline now reserves the inherited lead-in.** The chain placeholder (shown when `prev_latent` is connected, LTX or any Wan variant) no longer just overlays the first segment — it now occupies real space at the start of the timeline and pushes every segment to the right by the inherited lead-in. The whole content band is squeezed via a single render-time transform (with the inverse applied to mouse input), so dragging/hit-testing stays accurate and no segment's stored position is ever mutated. The placeholder width equals the actual carried tail (`_CHAIN_TAIL_LATENT_FRAMES` × VAE temporal stride — 16 frames for LTX, 8 for Wan); on long timelines it is a thin band (tune `getChainLeadFrames()` in `ltx_director.js` for a more prominent fixed-seconds placeholder).
+
 **v1.15.0**
   * **Chained Director timelines show the inherited lead-in.** When a Director's `prev_latent` is connected (LTX or any Wan variant), the timeline now draws a translucent grey "◄ 上一段延續" placeholder at the very start, standing in for the carried-over tail motion clip from the previous chunk. The width matches the actual lead-in (`_CHAIN_TAIL_LATENT_FRAMES` × the model's VAE temporal stride — 16 frames for LTX, 8 for Wan). It is purely visual and never moves or alters the real segments.
 
