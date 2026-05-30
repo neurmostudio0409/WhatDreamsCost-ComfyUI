@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.15.0**
+  * **Chained Director timelines show the inherited lead-in.** When a Director's `prev_latent` is connected (LTX or any Wan variant), the timeline now draws a translucent grey "◄ 上一段延續" placeholder at the very start, standing in for the carried-over tail motion clip from the previous chunk. The width matches the actual lead-in (`_CHAIN_TAIL_LATENT_FRAMES` × the model's VAE temporal stride — 16 frames for LTX, 8 for Wan). It is purely visual and never moves or alters the real segments.
+
 **v1.14.0**
   * **`Long Video Stitcher` — dynamic latent inputs.** The latent input slots now grow as you connect chunks (and shrink when you disconnect), up to 12. Connect as many chunks as you need without pre-wiring empty slots. Audio latents still work (a second instance for the audio track).
 

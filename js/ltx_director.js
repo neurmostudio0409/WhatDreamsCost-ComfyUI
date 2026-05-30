@@ -8,6 +8,18 @@ const AUDIO_TRACK_HEIGHT = 80;
 const CANVAS_HEIGHT = RULER_HEIGHT + BLOCK_HEIGHT + AUDIO_TRACK_HEIGHT;
 const HANDLE_HIT_PX = 14;
 const MIN_SEGMENT_LENGTH = 6;
+// Width (in pixel-space timeline frames) of the "carried from previous chunk" ghost
+// shown at the start of a chained Director. The Python side carries the last
+// _CHAIN_TAIL_LATENT_FRAMES (2) latent frames of the previous chunk as a motion clip;
+// the pixel-frame lead-in that occupies is those latent frames × the model's VAE
+// temporal stride. LTX uses stride 8 (→16 frames), Wan variants use stride 4 (→8).
+// Purely a visual placeholder for the inherited lead-in.
+const _CHAIN_TAIL_LATENT_FRAMES = 2;
+function chainGhostFrames(node) {
+  const cls = (node?.comfyClass || node?.type || "");
+  const stride = cls.startsWith("Wan") ? 4 : 8;
+  return _CHAIN_TAIL_LATENT_FRAMES * stride;
+}
 const MAX_THUMBNAIL_DIM = 512; // Increased to maintain quality for taller images
 
 const HIDDEN_WIDGET_NAMES = ["timeline_data", "local_prompts", "segment_lengths", "guide_strength", "audio_data", "use_custom_audio"];
@@ -2269,6 +2281,49 @@ class TimelineEditor {
       this.ctx.restore();
       */
     }
+
+    // --- Chain inheritance ghost ---
+    // When this Director is chained from a previous chunk (its prev_latent input is
+    // connected), show a transparent grey placeholder at the very start standing in for
+    // the carried-over tail frames of the previous chunk — it "occupies" those lead-in
+    // seconds so it's clear the new content effectively continues after them. Purely
+    // visual; it does not move or alter the real segments.
+    try {
+      const prevInput = this.node?.inputs?.find(inp => inp.name === "prev_latent");
+      if (prevInput && prevInput.link != null) {
+        const ghostFrames = Math.min(totalFrames, chainGhostFrames(this.node));
+        const gw = (ghostFrames / totalFrames) * width;
+        if (gw > 1) {
+          const gy = RULER_HEIGHT;
+          const gh = this.blockHeight;
+          this.ctx.save();
+          // Translucent grey fill over the lead-in region.
+          this.ctx.fillStyle = "rgba(150, 150, 150, 0.30)";
+          this.ctx.fillRect(0, gy, gw, gh);
+          // Dashed right boundary.
+          this.ctx.strokeStyle = "rgba(210, 210, 210, 0.75)";
+          this.ctx.lineWidth = 1.5;
+          this.ctx.setLineDash([4, 4]);
+          this.ctx.beginPath();
+          this.ctx.moveTo(gw, gy);
+          this.ctx.lineTo(gw, gy + gh);
+          this.ctx.stroke();
+          this.ctx.setLineDash([]);
+          // Label (clipped to the ghost box).
+          if (gw > 28) {
+            this.ctx.beginPath();
+            this.ctx.rect(0, gy, gw, gh);
+            this.ctx.clip();
+            this.ctx.fillStyle = "rgba(225, 225, 225, 0.9)";
+            this.ctx.font = "10px sans-serif";
+            this.ctx.textAlign = "center";
+            this.ctx.textBaseline = "middle";
+            this.ctx.fillText("◄ 上一段延續", gw / 2, gy + gh / 2);
+          }
+          this.ctx.restore();
+        }
+      }
+    } catch (e) { /* non-fatal visual overlay */ }
 
     // --- Draw Playhead ---
     const playheadX = (this.currentFrame / totalFrames) * width;
