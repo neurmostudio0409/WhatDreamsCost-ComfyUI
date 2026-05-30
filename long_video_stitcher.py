@@ -1,7 +1,7 @@
 """Long Video Stitcher — utilities for chaining multiple Director/sampler chunks
 into a single long video latent.
 
-Three nodes:
+Nodes:
 
 - LongVideoStitcher: concatenates up to 6 latent chunks along the temporal axis.
   Supports three seam modes: `drop` (drop overlap_frames from each preceding
@@ -13,11 +13,12 @@ Three nodes:
   This is the "frame_offset" pattern for LTX, which has no native frame_offset
   the way Wan's S2V / Animate / VACE do.
 
-- LongChunkSampler: runs KSampler N times in one node, seeding each chunk from
-  the previous chunk's tail latent (the front `seed_overlap_latent_frames` of
-  every chunk after the first is locked to the previous chunk's tail via a
-  noise_mask). Output is a single stitched latent. Best for "hold B for a long
-  time" workflows where the conditioning is the same across chunks.
+- LightningLoraPreset: applies a Lightning / distilled LoRA and emits the
+  recommended sampler config for the chosen preset.
+
+- LongChainSampler: runs KSampler once per chunk (one prompt per line, count
+  set by num_chunks), seeding each chunk from the previous chunk's tail and
+  stitching the result into one latent.
 
 Audio latents are handled separately — these nodes operate on video latents
 only.
@@ -286,155 +287,8 @@ class LatentTailToImage(io.ComfyNode):
         return io.NodeOutput(decoded)
 
 
-class LongChunkSampler(io.ComfyNode):
-    """Run KSampler N times to produce a long video latent in one node.
-
-    Each chunk after the first has its leading `seed_overlap_latent_frames`
-    locked to the previous chunk's tail (via a noise_mask = 0 on those
-    frames), so the sampler must denoise the remainder consistent with the
-    seeded prefix. The stitched output drops the seeded prefix of each
-    chunk after the first so the seam doesn't double up.
-
-    Best fit: "extend the same shot for N × chunk_length" workflows where
-    the same conditioning (positive / negative / model) applies across all
-    chunks. For per-chunk prompt evolution chain Director + KSampler
-    manually and use LongVideoStitcher to combine.
-
-    Notes:
-    - The conditioning is identical for every chunk, including any
-      prompt-relay attention mask that was patched onto the model. The
-      latent shape must match the shape the mask was built for, which is
-      automatic when the input `latent` came straight from the same
-      Director that patched the model.
-    - For Wan I2V/FLF this still re-anchors each chunk on the original
-      start_image (because that's baked into the positive conditioning via
-      concat_latent_image). Use only for hold-style extensions on Wan.
-    """
-
-    @classmethod
-    def define_schema(cls):
-        return io.Schema(
-            node_id="LongChunkSampler",
-            display_name="Long Chunk Sampler",
-            category="WhatDreamsCost",
-            description=(
-                "Runs KSampler num_chunks times, seeding each chunk after the first "
-                "from the previous chunk's tail (locked via noise_mask), and outputs "
-                "a single stitched latent. Same conditioning for every chunk; for "
-                "per-chunk prompt evolution chain Director + KSampler manually."
-            ),
-            inputs=[
-                io.Model.Input("model"),
-                io.Conditioning.Input("positive"),
-                io.Conditioning.Input("negative"),
-                io.Latent.Input("latent", tooltip="Chunk-length latent (output of a Director)."),
-                io.Int.Input(
-                    "num_chunks", default=3, min=1, max=20, step=1,
-                    tooltip="How many chunks to generate and stitch. Total output length = chunk_length × num_chunks − (num_chunks − 1) × seed_overlap_latent_frames.",
-                ),
-                io.Int.Input(
-                    "seed_overlap_latent_frames", default=1, min=1, max=16, step=1,
-                    tooltip="Latent frames at the front of each chunk (after the first) that are locked to the previous chunk's tail. Drives continuity at every seam.",
-                ),
-                io.Int.Input(
-                    "steps", default=20, min=1, max=200, step=1,
-                ),
-                io.Float.Input(
-                    "cfg", default=3.0, min=0.0, max=20.0, step=0.1,
-                ),
-                io.Combo.Input(
-                    "sampler_name", options=comfy.samplers.KSampler.SAMPLERS, default="euler",
-                ),
-                io.Combo.Input(
-                    "scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="normal",
-                ),
-                io.Int.Input(
-                    "seed", default=0, min=0, max=0xffffffffffffffff,
-                    tooltip="Base seed. Each chunk uses seed + chunk_index so they don't all collapse to the same noise pattern.",
-                ),
-                io.Float.Input(
-                    "denoise", default=1.0, min=0.0, max=1.0, step=0.01,
-                ),
-            ],
-            outputs=[
-                io.Latent.Output(display_name="latent"),
-            ],
-        )
-
-    @classmethod
-    def execute(cls, model, positive, negative, latent,
-                num_chunks=3, seed_overlap_latent_frames=1,
-                steps=20, cfg=3.0, sampler_name="euler", scheduler="normal",
-                seed=0, denoise=1.0) -> io.NodeOutput:
-        base_samples = latent["samples"]
-        if base_samples.dim() != 5:
-            raise ValueError(
-                f"LongChunkSampler: expected a 5D video latent [B,C,T,H,W], got shape "
-                f"{tuple(base_samples.shape)}."
-            )
-
-        base_T = base_samples.shape[2]
-        overlap = max(1, int(seed_overlap_latent_frames))
-        if overlap >= base_T:
-            raise ValueError(
-                f"LongChunkSampler: seed_overlap_latent_frames ({overlap}) must be smaller "
-                f"than the latent's temporal length ({base_T})."
-            )
-
-        num_chunks = max(1, int(num_chunks))
-        all_chunks = []
-
-        for chunk_idx in range(num_chunks):
-            chunk_seed = (int(seed) + chunk_idx) & 0xffffffffffffffff
-
-            if chunk_idx == 0:
-                chunk_latent = latent
-            else:
-                prev_samples = all_chunks[-1]["samples"]
-                new_samples = base_samples.clone()
-                copy = min(overlap, prev_samples.shape[2])
-                new_samples[:, :, :copy] = prev_samples[:, :, -copy:]
-                # noise_mask=0 means "preserve" (don't denoise this region) for the
-                # ComfyUI sampler. Shape [B,1,T,1,1] broadcasts across spatial dims.
-                mask = torch.ones(
-                    (new_samples.shape[0], 1, new_samples.shape[2], 1, 1),
-                    dtype=new_samples.dtype, device=new_samples.device,
-                )
-                mask[:, :, :copy] = 0.0
-                chunk_latent = {"samples": new_samples, "noise_mask": mask}
-
-            log.info(
-                "[LongChunkSampler] Chunk %d/%d: seed=%d, latent shape=%s",
-                chunk_idx + 1, num_chunks, chunk_seed,
-                tuple(chunk_latent["samples"].shape),
-            )
-
-            sampled = nodes.common_ksampler(
-                model, chunk_seed, int(steps), float(cfg), sampler_name, scheduler,
-                positive, negative, chunk_latent, denoise=float(denoise),
-            )[0]
-            all_chunks.append(sampled)
-
-        # Stitch: drop the seeded prefix from every chunk after the first so the
-        # overlap doesn't double up. Chunk 0 contributes its full latent.
-        stitched_parts = [all_chunks[0]["samples"]]
-        for chunk in all_chunks[1:]:
-            s = chunk["samples"]
-            if overlap < s.shape[2]:
-                stitched_parts.append(s[:, :, overlap:])
-            else:
-                stitched_parts.append(s)
-
-        final = torch.cat(stitched_parts, dim=2)
-        log.info(
-            "[LongChunkSampler] Final stitched latent: %s (chunks=%d, per-chunk T=%d, overlap=%d)",
-            tuple(final.shape), num_chunks, base_T, overlap,
-        )
-        return io.NodeOutput({"samples": final})
-
-
 # ---------------------------------------------------------------------------
-# Phase 3 — Lightning LoRA preset + per-chunk-prompt sampler
+# Lightning LoRA preset
 # ---------------------------------------------------------------------------
 
 
@@ -457,7 +311,7 @@ class LightningLoraPreset(io.ComfyNode):
     Bundles `LoraLoader` + the "what steps / cfg / sampler / scheduler do I
     use for this 4-step Lightning thing?" lookup into one node. Wire the
     `steps / cfg / sampler_name / scheduler` outputs into KSampler (or
-    LongChunkSampler) so you don't have to remember the magic numbers.
+    LongChainSampler) so you don't have to remember the magic numbers.
 
     For Wan2.2 MoE 14B, this only patches one model. If you want the
     high-noise and low-noise pair both patched, chain two of these nodes (one
@@ -473,7 +327,7 @@ class LightningLoraPreset(io.ComfyNode):
             description=(
                 "Apply a Lightning / distilled LoRA to the model (and optionally CLIP) "
                 "and output the recommended sampler config for the chosen preset. "
-                "Wire steps/cfg/sampler_name/scheduler into KSampler or LongChunkSampler."
+                "Wire steps/cfg/sampler_name/scheduler into KSampler or LongChainSampler."
             ),
             inputs=[
                 io.Model.Input("model", tooltip="Diffusion model to apply the LoRA to."),
@@ -540,134 +394,6 @@ class LightningLoraPreset(io.ComfyNode):
         return io.NodeOutput(model_out, clip_out, steps, cfg, sampler_name, scheduler)
 
 
-class LongChunkSamplerMulti(io.ComfyNode):
-    """Per-chunk-prompt variant of LongChunkSampler.
-
-    Accepts up to 6 positive conditionings (one per chunk) plus a single shared
-    negative. The sampler runs once per provided positive, seeding each chunk
-    after the first from the previous chunk's tail latent (the leading
-    `seed_overlap_latent_frames` are locked via noise_mask=0). num_chunks is
-    derived from the number of positives connected.
-
-    Use this when each chunk should be driven by a different prompt (so each
-    Director produces its own positive). The model is shared across all
-    chunks — the model's prompt-relay mask must therefore be valid for the
-    chunk-length latent of every chunk. Easiest way: use the same chunk_length
-    timeline_data in every Director.
-    """
-
-    @classmethod
-    def define_schema(cls):
-        return io.Schema(
-            node_id="LongChunkSamplerMulti",
-            display_name="Long Chunk Sampler (Multi-Prompt)",
-            category="WhatDreamsCost",
-            description=(
-                "Runs KSampler once per connected positive conditioning, seeding each "
-                "chunk after the first from the previous chunk's tail. For per-chunk "
-                "prompt evolution. num_chunks = number of positive inputs connected."
-            ),
-            inputs=[
-                io.Model.Input("model"),
-                io.Conditioning.Input("negative", tooltip="Negative conditioning, shared across every chunk."),
-                io.Latent.Input("latent", tooltip="Chunk-length latent template (output of a Director)."),
-                io.Conditioning.Input("positive_1", tooltip="Chunk 1 positive (required)."),
-                io.Conditioning.Input("positive_2", optional=True, tooltip="Chunk 2 positive."),
-                io.Conditioning.Input("positive_3", optional=True, tooltip="Chunk 3 positive."),
-                io.Conditioning.Input("positive_4", optional=True, tooltip="Chunk 4 positive."),
-                io.Conditioning.Input("positive_5", optional=True, tooltip="Chunk 5 positive."),
-                io.Conditioning.Input("positive_6", optional=True, tooltip="Chunk 6 positive."),
-                io.Int.Input(
-                    "seed_overlap_latent_frames", default=1, min=1, max=16, step=1,
-                    tooltip="Latent frames at the front of each chunk after the first that are locked to the previous chunk's tail.",
-                ),
-                io.Int.Input("steps", default=20, min=1, max=200, step=1),
-                io.Float.Input("cfg", default=3.0, min=0.0, max=20.0, step=0.1),
-                io.Combo.Input("sampler_name", options=comfy.samplers.KSampler.SAMPLERS, default="euler"),
-                io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="normal"),
-                io.Int.Input(
-                    "seed", default=0, min=0, max=0xffffffffffffffff,
-                    tooltip="Base seed. Chunk K uses seed + K.",
-                ),
-                io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01),
-            ],
-            outputs=[
-                io.Latent.Output(display_name="latent"),
-            ],
-        )
-
-    @classmethod
-    def execute(cls, model, negative, latent, positive_1,
-                positive_2=None, positive_3=None, positive_4=None,
-                positive_5=None, positive_6=None,
-                seed_overlap_latent_frames=1,
-                steps=20, cfg=3.0, sampler_name="euler", scheduler="normal",
-                seed=0, denoise=1.0) -> io.NodeOutput:
-        positives = [p for p in (positive_1, positive_2, positive_3, positive_4,
-                                 positive_5, positive_6) if p is not None]
-        num_chunks = len(positives)
-
-        base_samples = latent["samples"]
-        if base_samples.dim() != 5:
-            raise ValueError(
-                f"LongChunkSamplerMulti: expected a 5D video latent [B,C,T,H,W], got "
-                f"shape {tuple(base_samples.shape)}."
-            )
-
-        base_T = base_samples.shape[2]
-        overlap = max(1, int(seed_overlap_latent_frames))
-        if overlap >= base_T:
-            raise ValueError(
-                f"LongChunkSamplerMulti: seed_overlap_latent_frames ({overlap}) must be "
-                f"smaller than the latent's temporal length ({base_T})."
-            )
-
-        all_chunks = []
-        for chunk_idx, positive in enumerate(positives):
-            chunk_seed = (int(seed) + chunk_idx) & 0xffffffffffffffff
-
-            if chunk_idx == 0:
-                chunk_latent = latent
-            else:
-                prev_samples = all_chunks[-1]["samples"]
-                new_samples = base_samples.clone()
-                copy = min(overlap, prev_samples.shape[2])
-                new_samples[:, :, :copy] = prev_samples[:, :, -copy:]
-                mask = torch.ones(
-                    (new_samples.shape[0], 1, new_samples.shape[2], 1, 1),
-                    dtype=new_samples.dtype, device=new_samples.device,
-                )
-                mask[:, :, :copy] = 0.0
-                chunk_latent = {"samples": new_samples, "noise_mask": mask}
-
-            log.info(
-                "[LongChunkSamplerMulti] Chunk %d/%d: seed=%d, latent shape=%s",
-                chunk_idx + 1, num_chunks, chunk_seed,
-                tuple(chunk_latent["samples"].shape),
-            )
-
-            sampled = nodes.common_ksampler(
-                model, chunk_seed, int(steps), float(cfg), sampler_name, scheduler,
-                positive, negative, chunk_latent, denoise=float(denoise),
-            )[0]
-            all_chunks.append(sampled)
-
-        stitched_parts = [all_chunks[0]["samples"]]
-        for chunk in all_chunks[1:]:
-            s = chunk["samples"]
-            if overlap < s.shape[2]:
-                stitched_parts.append(s[:, :, overlap:])
-            else:
-                stitched_parts.append(s)
-
-        final = torch.cat(stitched_parts, dim=2)
-        log.info(
-            "[LongChunkSamplerMulti] Final stitched latent: %s (chunks=%d, per-chunk T=%d, overlap=%d)",
-            tuple(final.shape), num_chunks, base_T, overlap,
-        )
-        return io.NodeOutput({"samples": final})
-
-
 # ---------------------------------------------------------------------------
 # Dynamic N-chunk sampler — one prompt per chunk via a multiline list
 # ---------------------------------------------------------------------------
@@ -679,8 +405,7 @@ def _sample_and_stitch_chunks(model, positives, negative, base_latent, overlap,
     the first from the previous chunk's tail (front `overlap` latent frames locked
     via noise_mask=0), then stitch by dropping each chunk's seeded prefix.
 
-    Shared by the dynamic LongChainSampler; mirrors the inline loop in
-    LongChunkSampler / LongChunkSamplerMulti. Returns {"samples": stitched}.
+    Used by LongChainSampler. Returns {"samples": stitched}.
     """
     base_samples = base_latent["samples"]
     if base_samples.dim() != 5:
@@ -733,9 +458,9 @@ def _sample_and_stitch_chunks(model, positives, negative, base_latent, overlap,
 class LongChainSampler(io.ComfyNode):
     """Dynamic long-video sampler — set the chunk count and feed one prompt per chunk.
 
-    Unlike LongChunkSamplerMulti (capped at 6 conditioning sockets), the per-chunk
-    prompts are a multiline list — one prompt per line (`|` also separates) — so the
-    chunk count is unbounded. `num_chunks` drives how many chunks are generated:
+    The per-chunk prompts are a multiline list — one prompt per line (`|` also
+    separates) — so the chunk count is unbounded. `num_chunks` drives how many
+    chunks are generated:
 
     - num_chunks = 0  → generate exactly one chunk per prompt line.
     - num_chunks = N  → generate N chunks; if there are fewer prompt lines than N the

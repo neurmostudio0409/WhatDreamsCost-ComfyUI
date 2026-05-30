@@ -8,18 +8,6 @@ const AUDIO_TRACK_HEIGHT = 80;
 const CANVAS_HEIGHT = RULER_HEIGHT + BLOCK_HEIGHT + AUDIO_TRACK_HEIGHT;
 const HANDLE_HIT_PX = 14;
 const MIN_SEGMENT_LENGTH = 6;
-// Width (in pixel-space timeline frames) of the "carried from previous chunk" ghost
-// shown at the start of a chained Director. The Python side carries the last
-// _CHAIN_TAIL_LATENT_FRAMES (2) latent frames of the previous chunk as a motion clip;
-// the pixel-frame lead-in that occupies is those latent frames × the model's VAE
-// temporal stride. LTX uses stride 8 (→16 frames), Wan variants use stride 4 (→8).
-// Purely a visual placeholder for the inherited lead-in.
-const _CHAIN_TAIL_LATENT_FRAMES = 2;
-function chainGhostFrames(node) {
-  const cls = (node?.comfyClass || node?.type || "");
-  const stride = cls.startsWith("Wan") ? 4 : 8;
-  return _CHAIN_TAIL_LATENT_FRAMES * stride;
-}
 const MAX_THUMBNAIL_DIM = 512; // Increased to maintain quality for taller images
 
 const HIDDEN_WIDGET_NAMES = ["timeline_data", "local_prompts", "segment_lengths", "guide_strength", "audio_data", "use_custom_audio"];
@@ -802,34 +790,6 @@ class TimelineEditor {
     return Math.max(outputDuration, Math.ceil(furthest * 1.30));
   }
 
-  // Number of timeline frames the chain "lead-in" ghost occupies, or 0 when this
-  // Director is not chained. A Director is chained when its prev_latent input is
-  // connected — the backend then carries the last _CHAIN_TAIL_LATENT_FRAMES latent
-  // frames of the previous chunk as a motion clip; the pixel-frame lead-in that
-  // represents is chainGhostFrames() (node-type aware: 16 for LTX, 8 for Wan).
-  getChainLeadFrames() {
-    const prevInput = this.node?.inputs?.find(inp => inp.name === "prev_latent");
-    if (!prevInput || prevInput.link == null) return 0;
-    return chainGhostFrames(this.node);
-  }
-
-  // Horizontal layout metrics for the chain lead-in. When chained, the timeline
-  // content is squeezed into the pixel band [leadPx, width] (uniform scale) so the
-  // ghost can occupy [0, leadPx] at the very start, visually shifting every segment
-  // right by the inherited lead-in WITHOUT touching any segment's stored .start.
-  // Returns the identity ({leadPx:0, scale:1}) when not chained, so callers are
-  // unaffected in the common case.
-  _chainLeadMetrics() {
-    const width = this.canvas.offsetWidth || this._lastWidth || 0;
-    const leadFrames = this.getChainLeadFrames();
-    const contentFrames = this.getVisualDurationFrames();
-    if (!width || leadFrames <= 0 || contentFrames <= 0) {
-      return { leadFrames: 0, leadPx: 0, scale: 1 };
-    }
-    const denom = contentFrames + leadFrames;
-    return { leadFrames, leadPx: (leadFrames / denom) * width, scale: contentFrames / denom };
-  }
-
   // Sync the zoom slider's max attribute to the current getMaxZoom() value,
   // clamping zoomLevel if it now exceeds the new max.
   updateZoomSliderMax() {
@@ -1531,14 +1491,8 @@ class TimelineEditor {
     const scaleX = this.canvas.offsetWidth / rect.width;
     const scaleY = this.canvas.offsetHeight / rect.height;
 
-    let x = (e.clientX - rect.left) * scaleX;
+    const x = (e.clientX - rect.left) * scaleX;
     const y = (e.clientY - rect.top) * scaleY;
-    // Invert the chain lead-in transform applied in render() so every downstream
-    // hit-test / frame calc sees x in the same "logical" content space the segment
-    // positions are computed in. Identity when not chained. Clicks inside the ghost
-    // band map to negative x and are clamped to frame 0 by callers.
-    const { leadPx, scale } = this._chainLeadMetrics();
-    if (leadPx > 0) x = (x - leadPx) / scale;
     return { x, y };
   }
 
@@ -1886,26 +1840,11 @@ class TimelineEditor {
 
 
 
-    // Render Track Backgrounds (full width, in screen space — the ghost overlays these)
+    // Render Track Backgrounds
     this.ctx.fillStyle = "#111"; // Image track bg
     this.ctx.fillRect(0, RULER_HEIGHT, width, this.blockHeight);
     this.ctx.fillStyle = "#111"; // Audio track bg
     this.ctx.fillRect(0, RULER_HEIGHT + this.blockHeight, width, this.audioTrackHeight);
-
-    // --- Chain lead-in transform ---
-    // When this Director is chained (prev_latent connected), squeeze all timeline
-    // content into [leadPx, width] so the inherited lead-in ghost can occupy the
-    // [0, leadPx] band at the start. Implemented as a ctx translate+scale so every
-    // frame→pixel calc below (segments, ruler, gaps, cutoff, playhead) and the
-    // inverse in getMousePos() stay in one consistent "logical" space — no per-site
-    // offset math, and segment .start values are never mutated. Identity when not
-    // chained. Restored just before the viewport-edge grab bars (which are screen UI).
-    const _chainLead = this._chainLeadMetrics();
-    this.ctx.save();
-    if (_chainLead.leadPx > 0) {
-      this.ctx.translate(_chainLead.leadPx, 0);
-      this.ctx.scale(_chainLead.scale, 1);
-    }
 
 
 
@@ -2351,46 +2290,6 @@ class TimelineEditor {
     this.ctx.lineTo(playheadX, 14);
     this.ctx.lineTo(playheadX - 6, 8);
     this.ctx.fill();
-
-    // End the chain lead-in transform — everything below is screen-space UI.
-    this.ctx.restore();
-
-    // --- Chain lead-in ghost ---
-    // Drawn in screen space over the [0, leadPx] band the transform reserved. It stands
-    // in for the carried-over tail motion clip from the previous chunk, making it clear
-    // the new content effectively continues after that inherited lead-in. Purely visual.
-    if (_chainLead.leadPx > 0) {
-      const gleadPx = _chainLead.leadPx;
-      const gy = RULER_HEIGHT;
-      const gh = this.blockHeight;
-      this.ctx.save();
-      // Translucent grey fill over both the lead-in block and its ruler slice.
-      this.ctx.fillStyle = "rgba(150, 150, 150, 0.30)";
-      this.ctx.fillRect(0, gy, gleadPx, gh);
-      this.ctx.fillStyle = "rgba(150, 150, 150, 0.18)";
-      this.ctx.fillRect(0, 0, gleadPx, RULER_HEIGHT);
-      // Dashed right boundary where the inherited lead-in ends and real content begins.
-      this.ctx.strokeStyle = "rgba(210, 210, 210, 0.8)";
-      this.ctx.lineWidth = 1.5;
-      this.ctx.setLineDash([4, 4]);
-      this.ctx.beginPath();
-      this.ctx.moveTo(gleadPx, 0);
-      this.ctx.lineTo(gleadPx, gy + gh);
-      this.ctx.stroke();
-      this.ctx.setLineDash([]);
-      // Label, only when the band is wide enough to fit it (clipped to the band).
-      if (gleadPx > 30) {
-        this.ctx.beginPath();
-        this.ctx.rect(0, gy, gleadPx, gh);
-        this.ctx.clip();
-        this.ctx.fillStyle = "rgba(230, 230, 230, 0.9)";
-        this.ctx.font = "10px sans-serif";
-        this.ctx.textAlign = "center";
-        this.ctx.textBaseline = "middle";
-        this.ctx.fillText("◄ 上一段延續", gleadPx / 2, gy + gh / 2);
-      }
-      this.ctx.restore();
-    }
 
     // Draw vertical grab bar on the right edge of viewport for resizing width
     const grabBarW = 4;

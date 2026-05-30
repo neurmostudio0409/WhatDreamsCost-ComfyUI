@@ -36,7 +36,6 @@ from .ltx_director import (
     _load_image_tensor,
     _resize_image,
     _convert_to_latent_lengths,
-    _CHAIN_TAIL_LATENT_FRAMES,
 )
 
 log = logging.getLogger(__name__)
@@ -373,18 +372,17 @@ class WanDirector(io.ComfyNode):
         # --- Resolve start_image / end_image from timeline image segments ---
         img_segs = _extract_image_segments(timeline_data, duration_frames)
 
-        # --- Auto-chain: derive a start motion clip from the previous chunk's tail ---
+        # --- Auto-chain: derive a start frame from the previous chunk's tail ---
         # When prev_latent is wired and the timeline has no image segment, decode the previous
-        # chunk's last few frames so this chunk continues seamlessly from it. We carry a short
-        # MOTION CLIP (the last _CHAIN_TAIL_LATENT_FRAMES latent frames), not a single still, so
-        # the model continues the existing motion instead of restarting (no seam stutter). This
-        # counts as one image segment, so the variant resolves to an image-to-video mode.
+        # chunk's LAST latent frame and use it as this chunk's start image, so the chunk continues
+        # from where the last one ended. This counts as one image segment, so the variant resolves
+        # to an image-to-video mode.
         prev_start = None
         if prev_latent is not None and len(img_segs) == 0:
             if vae is None:
                 raise ValueError(
                     "WanDirector: prev_latent is connected but no vae. Connect the Wan VAE so "
-                    "the previous chunk's tail frames can be decoded."
+                    "the previous chunk's tail frame can be decoded."
                 )
             prev_samples = prev_latent["samples"]
             if prev_samples.dim() != 5:
@@ -392,14 +390,12 @@ class WanDirector(io.ComfyNode):
                     f"WanDirector: prev_latent must be a 5D video latent [B,C,T,H,W], got shape "
                     f"{tuple(prev_samples.shape)}."
                 )
-            k = min(_CHAIN_TAIL_LATENT_FRAMES, prev_samples.shape[2])
-            decoded = vae.decode(prev_samples[:, :, -k:].contiguous())
+            decoded = vae.decode(prev_samples[:, :, -1:].contiguous())  # last latent frame only
             if decoded.dim() == 5:  # [B,T,H,W,C] -> drop batch
                 decoded = decoded[0]
-            prev_start = decoded  # multi-frame motion clip placed at the front (masked by I2V/FLF)
-            log.info("[WanDirector] Auto-derived start motion clip from prev_latent tail: %s "
-                     "(%d latent frames) -> %d pixel frames",
-                     tuple(prev_samples.shape), k, prev_start.shape[0])
+            prev_start = decoded[-1:]  # single start frame (the continuation point)
+            log.info("[WanDirector] Auto-derived start_image from prev_latent tail: %s -> image %s",
+                     tuple(prev_samples.shape), tuple(prev_start.shape))
 
         effective_img_count = len(img_segs) + (1 if prev_start is not None else 0)
         variant = _resolve_variant(model_variant, geom, effective_img_count)
@@ -430,9 +426,7 @@ class WanDirector(io.ComfyNode):
         start_image = _load_seg(img_segs[0]) if len(img_segs) >= 1 else None
         end_image = _load_seg(img_segs[-1]) if len(img_segs) >= 2 else None
 
-        # No timeline start image but a previous-chunk tail clip was decoded → use it as the start.
-        # Keep all frames (multi-frame motion prefix); the I2V/FLF/TI2V conditioning upscales the
-        # clip to the target size itself, so we don't collapse it to a single frame here.
+        # No timeline start image but a previous-chunk tail frame was decoded → use it as the start.
         if start_image is None and prev_start is not None:
             start_image = prev_start
 
@@ -928,7 +922,6 @@ class WanAnimateDirector(io.ComfyNode):
             if reference_image is None:
                 reference_image = torch.zeros((1, height, width, 3))
 
-        trim_to_pose_video = False
         latent_length = ((length - 1) // 4) + 1
         latent_width = width // 8
         latent_height = height // 8
@@ -978,7 +971,7 @@ class WanAnimateDirector(io.ComfyNode):
             pose_video = pose_video[video_frame_offset:]
             pose_video = comfy.utils.common_upscale(pose_video[:length].movedim(-1, 1),
                                                     width, height, "area", "center").movedim(1, -1)
-            if not trim_to_pose_video and pose_video.shape[0] < length:
+            if pose_video.shape[0] < length:
                 pose_video = torch.cat((pose_video,) + (pose_video[-1:],) * (length - pose_video.shape[0]), dim=0)
             pose_video_latent = vae.encode(pose_video[:, :, :, :3])
             positive = node_helpers.conditioning_set_values(positive, {"pose_video_latent": pose_video_latent})
