@@ -466,10 +466,6 @@ class LTXDirector(io.ComfyNode):
                     "img_compression", default=18, min=0, max=100, step=1, optional=True,
                     tooltip="H.264 CRF compression to apply to each guide image. 0 = no compression, higher = more artefacts.",
                 ),
-                io.Float.Input(
-                    "start_image_strength", default=1.0, min=0.0, max=1.0, step=0.01, optional=True,
-                    tooltip="Guide strength of the start_image keyframe (only used when start_image is connected). 1.0 anchors the first frame hard for the smoothest chunk-to-chunk continuity.",
-                ),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -488,7 +484,8 @@ class LTXDirector(io.ComfyNode):
                 frame_rate=24, display_mode="seconds",
                 custom_width=768, custom_height=512, resize_method="maintain aspect ratio",
                 divisible_by=32, img_compression=0, audio_vae=None, optional_latent=None,
-                use_custom_audio=False, start_image=None, start_image_strength=1.0) -> io.NodeOutput:
+                use_custom_audio=False, start_image=None,
+                start_image_strength=1.0) -> io.NodeOutput:  # not a schema widget; hard-anchored at 1.0 for chaining
 
         # --- Build guide_data from image segments FIRST (to derive output dimensions) ---
         guide_data = {"images": [], "insert_frames": [], "strengths": [], "frame_rate": frame_rate}
