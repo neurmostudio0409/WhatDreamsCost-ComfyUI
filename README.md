@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.12.0**
+  * **Wan Director auto-chaining — `prev_latent` input.** `Wan Director` now chains the same way LTX Director does: connect the previous chunk's output video latent to `prev_latent` and it decodes the tail frame (reusing the connected `vae`) to use as this chunk's start image, automatically resolving to an image-to-video variant (`i2v-14b` / `ti2v-5b`). An explicit timeline start-image segment still takes priority. The advanced Wan Directors (`Wan S2V` / `Wan Animate`) already chain natively via their `frame_offset` / `continue_motion` inputs.
+
 **v1.11.0**
   * **LTX Director auto-chaining — `prev_latent` / `prev_vae` inputs.** Connect the previous chunk's output video latent to `prev_latent` (and the video VAE to `prev_vae`) and the Director automatically decodes its tail frame and uses it as this chunk's start keyframe. No more manually wiring a `Latent Tail to Image` node between chunks — just `Director → Director`. An explicit `start_image` still takes priority. The `2x30s Chain` example workflow now uses this auto-chain wiring.
 

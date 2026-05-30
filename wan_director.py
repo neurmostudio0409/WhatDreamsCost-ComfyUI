@@ -279,7 +279,15 @@ class WanDirector(io.ComfyNode):
                 io.Model.Input("model_high", tooltip="The Wan diffusion model. For MoE 14B this is the high-noise model."),
                 io.Model.Input("model_low", optional=True, tooltip="Optional — for Wan2.2 MoE 14B, the low-noise model. Patched with the same prompt-relay mask."),
                 io.Clip.Input("clip"),
-                io.Vae.Input("vae", optional=True, tooltip="Required for I2V / FLF / TI2V-5B (used to encode the start / end images)."),
+                io.Vae.Input("vae", optional=True, tooltip="Required for I2V / FLF / TI2V-5B (used to encode the start / end images). Also used to decode prev_latent's tail frame when auto-chaining."),
+                io.Latent.Input("prev_latent", optional=True,
+                                tooltip=(
+                                    "Optional. Connect the PREVIOUS chunk's output video latent to auto-chain: "
+                                    "the Director decodes its last frame (via the connected vae) and uses it as "
+                                    "this chunk's start image, so the new chunk continues seamlessly from where "
+                                    "the last one ended. Forces an image-to-video variant (i2v-14b / ti2v-5b). "
+                                    "Ignored when the timeline already has a start-image segment."
+                                )),
                 io.Conditioning.Input("negative", optional=True, tooltip="Optional negative conditioning. If unconnected an empty negative is built from clip."),
                 io.ClipVisionOutput.Input("clip_vision_start", optional=True, tooltip="Optional CLIP-Vision output of the start image (Wan I2V / FLF)."),
                 io.ClipVisionOutput.Input("clip_vision_end", optional=True, tooltip="Optional CLIP-Vision output of the end image (Wan FLF only)."),
@@ -342,7 +350,7 @@ class WanDirector(io.ComfyNode):
                 resize_method="maintain aspect ratio", divisible_by=16, img_compression=0,
                 model_variant="auto", use_custom_audio=False,
                 model_low=None, vae=None, negative=None,
-                clip_vision_start=None, clip_vision_end=None) -> io.NodeOutput:
+                clip_vision_start=None, clip_vision_end=None, prev_latent=None) -> io.NodeOutput:
 
         # --- Validate prompt segments ---
         locals_list = [p.strip() for p in local_prompts.split("|")]
@@ -363,7 +371,33 @@ class WanDirector(io.ComfyNode):
 
         # --- Resolve start_image / end_image from timeline image segments ---
         img_segs = _extract_image_segments(timeline_data, duration_frames)
-        variant = _resolve_variant(model_variant, geom, len(img_segs))
+
+        # --- Auto-chain: derive a start image from the previous chunk's tail frame ---
+        # When prev_latent is wired and the timeline has no image segment, decode the
+        # previous chunk's last frame so this chunk continues seamlessly from it. This
+        # counts as one image segment, so the variant resolves to an image-to-video mode.
+        prev_start = None
+        if prev_latent is not None and len(img_segs) == 0:
+            if vae is None:
+                raise ValueError(
+                    "WanDirector: prev_latent is connected but no vae. Connect the Wan VAE so "
+                    "the previous chunk's tail frame can be decoded."
+                )
+            prev_samples = prev_latent["samples"]
+            if prev_samples.dim() != 5:
+                raise ValueError(
+                    f"WanDirector: prev_latent must be a 5D video latent [B,C,T,H,W], got shape "
+                    f"{tuple(prev_samples.shape)}."
+                )
+            decoded = vae.decode(prev_samples[:, :, -1:].contiguous())
+            if decoded.dim() == 5:  # [B,T,H,W,C] -> drop batch
+                decoded = decoded[0]
+            prev_start = decoded[-1:]  # last pixel frame = the true continuation point
+            log.info("[WanDirector] Auto-derived start image from prev_latent tail: %s -> %s",
+                     tuple(prev_samples.shape), tuple(prev_start.shape))
+
+        effective_img_count = len(img_segs) + (1 if prev_start is not None else 0)
+        variant = _resolve_variant(model_variant, geom, effective_img_count)
 
         # Snap width/height to multiples
         tgt_w = custom_width if custom_width > 0 else width
@@ -390,6 +424,10 @@ class WanDirector(io.ComfyNode):
 
         start_image = _load_seg(img_segs[0]) if len(img_segs) >= 1 else None
         end_image = _load_seg(img_segs[-1]) if len(img_segs) >= 2 else None
+
+        # No timeline start image but a previous-chunk tail was decoded → use it as the start.
+        if start_image is None and prev_start is not None:
+            start_image = _resize_and_normalize(prev_start, tgt_w, tgt_h, divisible_by, resize_method)
 
         # Use the (possibly snapped from image) resolved dims for latent generation
         if start_image is not None:
