@@ -42,9 +42,10 @@ log = logging.getLogger(__name__)
 
 
 def _blend_overlap(left_tail, right_head, mode):
-    """Crossfade left_tail into right_head along time dim using the given mode.
+    """Crossfade left_tail into right_head along the temporal dim (dim=2).
 
-    Both tensors must have shape [B, C, T_overlap, H, W]. Returns a new
+    Works for 5D video latents [B,C,T,H,W] and 4D audio latents [B,C,T,F] —
+    the fade weights broadcast over whatever trailing dims exist. Returns a new
     tensor of the same shape. `mode` is one of "linear" or "cosine".
     """
     T = left_tail.shape[2]
@@ -55,7 +56,8 @@ def _blend_overlap(left_tail, right_head, mode):
     else:  # cosine
         t_lin = torch.linspace(0.0, 1.0, T, dtype=dtype, device=device)
         alpha = 0.5 - 0.5 * torch.cos(math.pi * t_lin)
-    alpha = alpha.view(1, 1, T, 1, 1)
+    # Broadcast over batch/channel (dims 0,1) and any trailing dims (H,W or F).
+    alpha = alpha.view(*([1, 1, T] + [1] * (left_tail.dim() - 3)))
     return left_tail * (1.0 - alpha) + right_head * alpha
 
 
@@ -352,6 +354,126 @@ class SmoothVideoStitcher(io.ComfyNode):
             positive, negative, latent, denoise=float(denoise),
         )[0]
         return io.NodeOutput({"samples": sampled["samples"]})
+
+
+def _concat_audio_latents(latents, overlap_frames, blend_mode="cosine"):
+    """Join 4D audio latents [B,C,T,F] along the temporal axis with a crossfade.
+
+    blend_mode "cosine"/"linear" crossfades the trailing `overlap_frames` of each
+    preceding chunk with the leading `overlap_frames` of the next (both sides are
+    consumed, one blended span is emitted) so the seam fades smoothly. "concat"
+    just butts the chunks together (the old LongVideoStitcher audio behaviour).
+    """
+    if not latents:
+        raise ValueError("SmoothAudioStitcher: no latents to stitch.")
+
+    samples_list = [l["samples"] for l in latents]
+    ref = samples_list[0]
+    if ref.dim() != 4:
+        raise ValueError(
+            f"SmoothAudioStitcher: expected 4D audio latents [B,C,T,F], got shape "
+            f"{tuple(ref.shape)}. (For video latents use Smooth Video Stitcher.)"
+        )
+    for i, s in enumerate(samples_list[1:], start=1):
+        if (s.shape[0], s.shape[1], s.shape[3]) != (ref.shape[0], ref.shape[1], ref.shape[3]):
+            raise ValueError(
+                f"SmoothAudioStitcher: chunk {i + 1} shape {tuple(s.shape)} does not match "
+                f"chunk 1 {tuple(ref.shape)} (batch / channels / freq-bins must agree)."
+            )
+
+    out_type = latents[0].get("type", "audio")
+    if len(samples_list) == 1:
+        return {"samples": ref, "type": out_type}
+
+    if overlap_frames <= 0 or blend_mode == "concat":
+        combined = torch.cat(samples_list, dim=2)
+    else:
+        parts = [samples_list[0]]
+        for i in range(1, len(samples_list)):
+            prev = parts[-1]
+            curr = samples_list[i]
+            # If either side is shorter than the overlap, fall back to plain concat
+            # for this seam to avoid mangling a short chunk.
+            if prev.shape[2] <= overlap_frames or curr.shape[2] <= overlap_frames:
+                parts.append(curr)
+                continue
+            prev_main = prev[:, :, :-overlap_frames]
+            prev_tail = prev[:, :, -overlap_frames:]
+            curr_head = curr[:, :, :overlap_frames]
+            curr_main = curr[:, :, overlap_frames:]
+            blended = _blend_overlap(prev_tail, curr_head, blend_mode)
+            parts[-1] = torch.cat([prev_main, blended], dim=2)
+            parts.append(curr_main)
+        combined = torch.cat(parts, dim=2)
+
+    log.info(
+        "[SmoothAudioStitcher] Stitched %d audio latents with mode=%s overlap=%d -> %s",
+        len(latents), blend_mode, overlap_frames, tuple(combined.shape),
+    )
+    return {"samples": combined, "type": out_type}
+
+
+_AUDIO_BLEND_MODES = ["cosine", "linear", "concat"]
+
+
+class SmoothAudioStitcher(io.ComfyNode):
+    """Join AUDIO-latent chunks with a smooth crossfade at each seam.
+
+    The audio counterpart to Smooth Video Stitcher. Connect your chunks' audio
+    latents (4D [B,C,T,F]) to latent_1..N (slots grow as you wire them) and the
+    node crossfades the overlap at every seam so the audio transitions smoothly
+    instead of cutting. Pure DSP — no model needed (an audio crossfade already
+    sounds smooth, and LTX audio is sampled jointly with video so there is no
+    standalone audio model to re-generate a seam with).
+
+    Audio latents only (4D); for video use Smooth Video Stitcher.
+    """
+
+    MAX_LATENTS = 12
+
+    @classmethod
+    def define_schema(cls):
+        latent_inputs = [io.Latent.Input("latent_1", tooltip="First chunk's audio latent (required).")]
+        for i in range(2, cls.MAX_LATENTS + 1):
+            latent_inputs.append(
+                io.Latent.Input(f"latent_{i}", optional=True, tooltip=f"Chunk {i} audio latent (optional).")
+            )
+        return io.Schema(
+            node_id="SmoothAudioStitcher",
+            display_name="Smooth Audio Stitcher",
+            category="WhatDreamsCost",
+            description=(
+                "Concatenates audio latents and crossfades the overlap at each seam "
+                "(cosine/linear) so chained chunks' audio transitions smoothly. Connect "
+                "chunks to latent_1..N (slots grow as you wire them). Pure crossfade — no "
+                "model needed. Audio latents only (4D); for video use Smooth Video Stitcher."
+            ),
+            inputs=[
+                *latent_inputs,
+                io.Int.Input(
+                    "overlap_frames", default=4, min=0, max=64, step=1, optional=True,
+                    tooltip="Audio latent frames crossfaded at each seam (both sides contribute). 0 / concat = no fade (plain concatenate).",
+                ),
+                io.Combo.Input(
+                    "blend_mode", options=_AUDIO_BLEND_MODES, default="cosine", optional=True,
+                    tooltip="cosine = smooth eased crossfade (best). linear = constant-rate crossfade. concat = just butt the chunks together (no fade).",
+                ),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, latent_1, latent_2=None, latent_3=None, latent_4=None,
+                latent_5=None, latent_6=None, latent_7=None, latent_8=None,
+                latent_9=None, latent_10=None, latent_11=None, latent_12=None,
+                overlap_frames=4, blend_mode="cosine") -> io.NodeOutput:
+        ordered = [latent_1, latent_2, latent_3, latent_4, latent_5, latent_6,
+                   latent_7, latent_8, latent_9, latent_10, latent_11, latent_12]
+        chunks = [l for l in ordered if l is not None]
+        out = _concat_audio_latents(chunks, int(overlap_frames), blend_mode)
+        return io.NodeOutput(out)
 
 
 class LatentTailToImage(io.ComfyNode):
