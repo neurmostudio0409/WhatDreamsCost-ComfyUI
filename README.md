@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.22.1**
+  * **`Smooth Video Stitcher` model re-gen is much faster.** It used to run the sampler over the *entire* concatenated video just to regenerate the small seam bands (cost scaled with the whole video length). It now re-samples only a small window around each seam (the band + a little context) and pastes the result back, so the cost scales with the seams, not the video length.
+
 **v1.22.0**
   * **New node: `LTX Smooth Transition` — native-FLF-smooth joins.** Stitchers can only crossfade/dissolve two already-finished chunks (the boundaries are fixed and incompatible). This node instead **generates** the join: for every adjacent pair it decodes chunk *i*'s last frame and chunk *i+1*'s first frame, treats them as the first/last keyframes of a fresh latent, and samples a real First-Last-Frame morph, splicing the result in as `[chunk 1][generated transition][chunk 2]...`. Because the model plans coherent motion across each transition, the joins are as smooth as a native FLF clip. Connect chunks to `latent_1..N` (slots grow) plus the LTX `model` + `vae` + `clip`; tune `transition_frames` (length of each generated bridge) and an optional `prompt`. LTX video latents only.
 

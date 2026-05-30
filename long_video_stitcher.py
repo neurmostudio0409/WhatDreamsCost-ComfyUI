@@ -346,31 +346,42 @@ class SmoothVideoStitcher(io.ComfyNode):
         combined = base["samples"]
         total_t = combined.shape[2]
         tf = max(1, int(transition_frames))
-        # noise_mask: 1 = regenerate (the seam bands), 0 = preserve (chunk interiors).
-        mask = torch.zeros(
-            (combined.shape[0], 1, total_t, 1, 1),
-            dtype=combined.dtype, device=combined.device,
-        )
-        for seam in seams:
-            lo = max(0, seam - tf)
-            hi = min(total_t, seam + tf)
-            mask[:, :, lo:hi] = 1.0
+        ctx = tf  # preserved context frames each side of the band, fed to the model
 
         # Blank (no-prompt) conditioning so the seam is just smoothed, not steered.
         empty = clip.encode_from_tokens_scheduled(clip.tokenize(""))
 
         log.info(
             "[SmoothVideoStitcher] %d chunks -> %d latent frames, %d seam(s) at %s, "
-            "regen band=%d each side, denoise=%.2f",
-            len(chunks), total_t, len(seams), seams, tf, float(denoise),
+            "regen band=%d each side (+%d ctx), denoise=%.2f — windowed re-sample",
+            len(chunks), total_t, len(seams), seams, tf, ctx, float(denoise),
         )
 
-        latent = {"samples": combined, "noise_mask": mask}
-        sampled = nodes.common_ksampler(
-            model, int(seed), int(steps), float(cfg), sampler_name, scheduler,
-            empty, empty, latent, denoise=float(denoise),
-        )[0]
-        return io.NodeOutput({"samples": sampled["samples"]})
+        # Re-sample ONLY a small window around each seam, not the whole video. Each
+        # window = the regen band [seam-tf, seam+tf] plus `ctx` preserved context
+        # frames on each side (so the model has temporal context). We then paste just
+        # the regenerated band back. Sampling cost is O(band) per seam instead of
+        # O(total video length) — the slow part of the old whole-latent pass.
+        out = combined.clone()
+        for k, seam in enumerate(seams):
+            lo = max(0, seam - tf - ctx)
+            hi = min(total_t, seam + tf + ctx)
+            band_lo = max(0, (seam - tf) - lo)
+            band_hi = min(hi - lo, (seam + tf) - lo)
+            if band_hi <= band_lo:
+                continue
+            win = out[:, :, lo:hi].clone()
+            wlen = win.shape[2]
+            wmask = torch.zeros((win.shape[0], 1, wlen, 1, 1), dtype=win.dtype, device=win.device)
+            wmask[:, :, band_lo:band_hi] = 1.0
+            sampled = nodes.common_ksampler(
+                model, (int(seed) + k) & 0xffffffffffffffff, int(steps), float(cfg),
+                sampler_name, scheduler, empty, empty,
+                {"samples": win, "noise_mask": wmask}, denoise=float(denoise),
+            )[0]["samples"]
+            out[:, :, lo + band_lo: lo + band_hi] = sampled[:, :, band_lo:band_hi]
+
+        return io.NodeOutput({"samples": out})
 
 
 def _concat_audio_latents(latents, overlap_frames, blend_mode="cosine"):
