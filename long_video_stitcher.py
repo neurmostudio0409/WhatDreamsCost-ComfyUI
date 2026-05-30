@@ -226,6 +226,134 @@ class LongVideoStitcher(io.ComfyNode):
         return io.NodeOutput(out)
 
 
+class SmoothVideoStitcher(io.ComfyNode):
+    """Join video-latent chunks with MODEL-GENERATED transitions at each seam.
+
+    Used like LongVideoStitcher — connect your chunk latents in order (latent_1..N
+    grow dynamically) — but instead of dropping/crossfading frames at the seam
+    (which reads as a cut or a dissolve) it concatenates the chunks and then
+    RE-SAMPLES a narrow band of `transition_frames` latent frames straddling every
+    seam with the diffusion model. The seam is therefore *generated* to flow from
+    one chunk into the next. Chunk interiors are locked (noise_mask = 0); only the
+    seam bands are denoised, so the rest of your video is untouched.
+
+    Wire a PLAIN model + a simple positive/negative here — NOT a model already
+    patched with a prompt-relay mask built for a single chunk's latent shape (the
+    concatenated latent is longer). Video latents only (5D [B,C,T,H,W]); for audio
+    use LongVideoStitcher.
+    """
+
+    MAX_LATENTS = 12
+
+    @classmethod
+    def define_schema(cls):
+        latent_inputs = [io.Latent.Input("latent_1", tooltip="First chunk (required).")]
+        for i in range(2, cls.MAX_LATENTS + 1):
+            latent_inputs.append(
+                io.Latent.Input(f"latent_{i}", optional=True, tooltip=f"Chunk {i} (optional).")
+            )
+        return io.Schema(
+            node_id="SmoothVideoStitcher",
+            display_name="Smooth Video Stitcher",
+            category="WhatDreamsCost",
+            description=(
+                "Concatenates video-latent chunks and regenerates a small band of frames at "
+                "each seam with the model, so the boundary is a generated transition instead "
+                "of a hard cut / dissolve. Connect chunks to latent_1..N (slots grow as you "
+                "wire them). Needs a plain model + positive/negative. Video latents only."
+            ),
+            inputs=[
+                io.Model.Input("model", tooltip="Plain diffusion model (NOT one patched with a prompt-relay mask for a single chunk's shape)."),
+                io.Conditioning.Input("positive", tooltip="Positive conditioning used to regenerate the seam frames (a simple scene/style prompt works well)."),
+                io.Conditioning.Input("negative", tooltip="Negative conditioning for the seam regeneration."),
+                *latent_inputs,
+                io.Int.Input(
+                    "transition_frames", default=2, min=1, max=16, step=1, optional=True,
+                    tooltip="Latent frames regenerated on EACH side of every seam. Larger = longer, smoother transition (but more of the original boundary is replaced).",
+                ),
+                io.Float.Input(
+                    "denoise", default=0.7, min=0.0, max=1.0, step=0.01, optional=True,
+                    tooltip="How hard the seam band is regenerated. Higher = stronger, smoother bridge; lower = preserve more of the original concatenated frames.",
+                ),
+                io.Int.Input("steps", default=20, min=1, max=200, step=1, optional=True),
+                io.Float.Input("cfg", default=3.0, min=0.0, max=20.0, step=0.1, optional=True),
+                io.Combo.Input("sampler_name", options=comfy.samplers.KSampler.SAMPLERS, default="euler", optional=True),
+                io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="normal", optional=True),
+                io.Int.Input(
+                    "seed", default=0, min=0, max=0xffffffffffffffff, optional=True,
+                    tooltip="Seed for the seam regeneration.",
+                ),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, positive, negative, latent_1, latent_2=None, latent_3=None,
+                latent_4=None, latent_5=None, latent_6=None, latent_7=None, latent_8=None,
+                latent_9=None, latent_10=None, latent_11=None, latent_12=None,
+                transition_frames=2, denoise=0.7, steps=20, cfg=3.0,
+                sampler_name="euler", scheduler="normal", seed=0) -> io.NodeOutput:
+        ordered = [latent_1, latent_2, latent_3, latent_4, latent_5, latent_6,
+                   latent_7, latent_8, latent_9, latent_10, latent_11, latent_12]
+        chunks = [l for l in ordered if l is not None]
+        if not chunks:
+            raise ValueError("SmoothVideoStitcher: no latents to stitch.")
+
+        samples_list = [l["samples"] for l in chunks]
+        ref = samples_list[0]
+        if ref.dim() != 5:
+            raise ValueError(
+                f"SmoothVideoStitcher: expected 5D video latents [B,C,T,H,W], got shape "
+                f"{tuple(ref.shape)}. (For audio latents use LongVideoStitcher.)"
+            )
+        for i, s in enumerate(samples_list[1:], start=1):
+            if (s.shape[0], s.shape[1], s.shape[3], s.shape[4]) != \
+               (ref.shape[0], ref.shape[1], ref.shape[3], ref.shape[4]):
+                raise ValueError(
+                    f"SmoothVideoStitcher: chunk {i + 1} shape {tuple(s.shape)} does not match "
+                    f"chunk 1 {tuple(ref.shape)} (batch / channels / spatial dims must agree)."
+                )
+
+        # A single chunk has no seam to smooth — pass it straight through.
+        if len(samples_list) == 1:
+            return io.NodeOutput(chunks[0])
+
+        combined = torch.cat(samples_list, dim=2)
+        total_t = combined.shape[2]
+
+        # Seam positions = cumulative chunk boundaries (first frame index of each
+        # following chunk). The regeneration band spans transition_frames on each side.
+        tf = max(1, int(transition_frames))
+        # noise_mask: 1 = regenerate (the seam bands), 0 = preserve (chunk interiors).
+        mask = torch.zeros(
+            (combined.shape[0], 1, total_t, 1, 1),
+            dtype=combined.dtype, device=combined.device,
+        )
+        cursor = 0
+        seams = []
+        for s in samples_list[:-1]:
+            cursor += s.shape[2]
+            seams.append(cursor)
+            lo = max(0, cursor - tf)
+            hi = min(total_t, cursor + tf)
+            mask[:, :, lo:hi] = 1.0
+
+        log.info(
+            "[SmoothVideoStitcher] %d chunks -> %d latent frames, %d seam(s) at %s, "
+            "regen band=%d each side, denoise=%.2f",
+            len(samples_list), total_t, len(seams), seams, tf, float(denoise),
+        )
+
+        latent = {"samples": combined, "noise_mask": mask}
+        sampled = nodes.common_ksampler(
+            model, int(seed), int(steps), float(cfg), sampler_name, scheduler,
+            positive, negative, latent, denoise=float(denoise),
+        )[0]
+        return io.NodeOutput({"samples": sampled["samples"]})
+
+
 class LatentTailToImage(io.ComfyNode):
     """VAE-decode the trailing N frames of a video latent into a pixel image.
 

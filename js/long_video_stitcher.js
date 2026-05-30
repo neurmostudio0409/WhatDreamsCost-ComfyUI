@@ -12,6 +12,8 @@ import { app } from "../../scripts/app.js";
 
 const MAX_LATENTS = 12;
 const MIN_VISIBLE = 2; // always show at least latent_1 + one spare
+// Nodes that expose dynamic latent_1..latent_12 inputs.
+const DYNAMIC_LATENT_NODES = ["LongVideoStitcher", "SmoothVideoStitcher"];
 
 function latentIndex(name) {
     const m = /^latent_(\d+)$/.exec(name || "");
@@ -62,7 +64,7 @@ function syncLatentInputs(node) {
 app.registerExtension({
     name: "Comfy.LongVideoStitcher.DynamicInputs",
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== "LongVideoStitcher") return;
+        if (!DYNAMIC_LATENT_NODES.includes(nodeData.name)) return;
 
         const onConnectionsChange = nodeType.prototype.onConnectionsChange;
         nodeType.prototype.onConnectionsChange = function (slotType, slotIndex, isConnected, link, ioSlot) {
@@ -75,7 +77,7 @@ app.registerExtension({
         };
     },
     async nodeCreated(node) {
-        if (node.comfyClass !== "LongVideoStitcher") return;
+        if (!DYNAMIC_LATENT_NODES.includes(node.comfyClass)) return;
         // Collapse to the minimal slot set on fresh nodes, and re-sync after a loaded
         // graph has restored its links.
         setTimeout(() => syncLatentInputs(node), 0);

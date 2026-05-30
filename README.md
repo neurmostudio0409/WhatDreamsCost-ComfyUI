@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.19.0**
+  * **New node: `Smooth Video Stitcher`.** Joins video-latent chunks like `Long Video Stitcher`, but instead of dropping/crossfading frames at each seam (which reads as a cut or a dissolve) it concatenates the chunks and **re-samples a small band of frames at every seam with the model**, so the boundary is a *generated* transition that flows from one chunk into the next. Connect your chunk latents to `latent_1..N` (slots grow as you wire them) and add a plain `model` + `positive`/`negative`; tune `transition_frames` (how wide the regenerated band is) and `denoise` (how strongly it's regenerated). Video latents only — for audio keep using `Long Video Stitcher`.
+
 **v1.18.0**
   * **Removed the image-segment Loop / repeat feature.** The per-segment `Loop` count (the `×N` badge + dashed cycle separators that held one image across N back-to-back cycles) is gone from the timeline UI and from the LTX / Wan backends. To hold an image for longer, just drag its segment edge to the length you want. Old saved workflows still load — any stored `loopCount` is simply ignored (the segment plays once at its base length).
 
