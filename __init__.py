@@ -12,6 +12,7 @@ from .long_video_stitcher import (
     LatentTailToImage,
     LongChunkSampler,
     LongChunkSamplerMulti,
+    LongChainSampler,
     LightningLoraPreset,
 )
 from comfy_api.latest import ComfyExtension, io
@@ -31,6 +32,7 @@ class PromptRelay(ComfyExtension):
             LatentTailToImage,
             LongChunkSampler,
             LongChunkSamplerMulti,
+            LongChainSampler,
             LightningLoraPreset,
         ]
 
@@ -54,6 +56,7 @@ NODE_CLASS_MAPPINGS = {
     "LatentTailToImage": LatentTailToImage,
     "LongChunkSampler": LongChunkSampler,
     "LongChunkSamplerMulti": LongChunkSamplerMulti,
+    "LongChainSampler": LongChainSampler,
     "LightningLoraPreset": LightningLoraPreset,
 }
 
@@ -74,6 +77,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LatentTailToImage": "Latent Tail to Image",
     "LongChunkSampler": "Long Chunk Sampler",
     "LongChunkSamplerMulti": "Long Chunk Sampler (Multi-Prompt)",
+    "LongChainSampler": "Long Chain Sampler (Dynamic)",
     "LightningLoraPreset": "Lightning LoRA Preset",
 }
 

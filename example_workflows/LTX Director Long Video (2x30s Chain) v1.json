@@ -904,7 +904,7 @@
       "title": "Stitch video (cosine)",
       "widgets_values": [
         2,
-        "cosine"
+        "drop"
       ]
     },
     {
@@ -993,7 +993,7 @@
       "color": "#223",
       "bgcolor": "#335",
       "widgets_values": [
-        "# 長影片串接 (2×30s → 60s)\n\n把單段 LTX 影片串成長片，過渡用「自動尾幀橋接 + cosine 混合」。\n\n**資料流**\n- **Chunk 1** = Director → Stage #1 → Stage #2\n- **Chunk 2 自動接續**：第二段 Director 的 prev_latent 接第一段輸出 latent、prev_vae 接 Video VAE。Director 會自動解碼第一段尾幀當本段起始幀，不需 Latent Tail to Image 節點。\n- **Stitch video (cosine)**：兩段影片潛空間以 cosine、overlap=2 混合接縫\n- **Stitch audio**：兩段音訊潛空間直接相接\n- 單一 **Decode** 輸出 60 秒\n\n**使用步驟**\n1. 在「兩個」LTX Director 的時間軸各放 prompt（至少 1 段 local prompt）。第一段可放起始圖；第二段不用（自動接尾幀）。\n2. 兩個 Director 的 custom_width 都已設 768。要改解析度請「兩個一起改」，否則接縫尺寸不符會報錯。\n3. 想要更多段：複製 Director+Stage#1+Stage#2，把上一段 Stage#2 的 latent 接到下一段 Director 的 prev_latent、Video VAE 接 prev_vae，輸出再接到 Stitch video / audio 的 latent_3..（最多 6 段）。\n4. 接縫若有輕微重影，把 Stitch video 的 blend_mode 改成 drop。\n\n注意：cosine 會吃掉影片 2 個 latent frame，音訊為直接相接，故音訊比影片長約 0.6 秒，屬正常。"
+        "# 長影片串接 (2×30s → 60s)\n\n把單段 LTX 影片串成長片。第二段 Director 自動接續第一段。\n\n**資料流**\n- **Chunk 1** = Director → Stage #1 → Stage #2\n- **Chunk 2 自動接續**：第二段 Director 的 prev_latent 接第一段輸出 latent、prev_vae 接 Video VAE。Director 會自動解碼第一段「尾端數幀的動態片段」當作本段開頭，讓動作延續、避免接縫卡頓（不是只取單張靜幀）。\n- **Stitch video (drop)**：以 drop 模式相接，去掉重複的尾幀（避免靜幀與動態幀交叉淡化造成的殘影/頓挫）。\n- **Stitch audio**：兩段音訊潛空間直接相接\n- 單一 **Decode** 輸出 60 秒\n\n**使用步驟**\n1. 在「兩個」LTX Director 的時間軸各放 prompt（至少 1 段 local prompt）。第一段可放起始圖；第二段不用（自動接尾幀動態片段）。\n2. 兩個 Director 的 custom_width 都已設 768。要改解析度請「兩個一起改」。\n3. 想要更多段：複製 Director+Stage#1+Stage#2，把上一段 Stage#2 的 latent 接到下一段 Director 的 prev_latent、Video VAE 接 prev_vae，輸出再接到 Stitch video / audio 的 latent_3..。\n\n**接縫還是頓？這樣調**\n- Stitch video 的 overlap_frames：若看到「重複/倒帶一下」就調大（2→3→4）；若看到「跳一下/缺一點」就調小。\n- 想攜帶更長的動作脈絡：程式常數 _CHAIN_TAIL_LATENT_FRAMES（ltx_director.py，預設 2）可調大成 3。\n- 兩段 prompt 差太多也會看起來像跳接，讓相鄰段的描述connection平滑些。\n\n注意：音訊為直接相接、影片 drop 會少掉約 overlap 個 latent frame，故音訊可能比影片長一點點，屬正常。"
       ]
     }
   ],

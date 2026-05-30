@@ -657,3 +657,162 @@ class LongChunkSamplerMulti(io.ComfyNode):
             tuple(final.shape), num_chunks, base_T, overlap,
         )
         return io.NodeOutput({"samples": final})
+
+
+# ---------------------------------------------------------------------------
+# Dynamic N-chunk sampler — one prompt per chunk via a multiline list
+# ---------------------------------------------------------------------------
+
+
+def _sample_and_stitch_chunks(model, positives, negative, base_latent, overlap,
+                              steps, cfg, sampler_name, scheduler, seed, denoise):
+    """Sample one chunk per conditioning in `positives`, seeding each chunk after
+    the first from the previous chunk's tail (front `overlap` latent frames locked
+    via noise_mask=0), then stitch by dropping each chunk's seeded prefix.
+
+    Shared by the dynamic LongChainSampler; mirrors the inline loop in
+    LongChunkSampler / LongChunkSamplerMulti. Returns {"samples": stitched}.
+    """
+    base_samples = base_latent["samples"]
+    if base_samples.dim() != 5:
+        raise ValueError(
+            f"LongChainSampler: expected a 5D video latent [B,C,T,H,W], got shape "
+            f"{tuple(base_samples.shape)}."
+        )
+    base_T = base_samples.shape[2]
+    overlap = max(1, int(overlap))
+    if overlap >= base_T:
+        raise ValueError(
+            f"LongChainSampler: seed_overlap_latent_frames ({overlap}) must be smaller than "
+            f"the latent's temporal length ({base_T})."
+        )
+
+    all_chunks = []
+    for i, positive in enumerate(positives):
+        chunk_seed = (int(seed) + i) & 0xffffffffffffffff
+        if i == 0:
+            chunk_latent = base_latent
+        else:
+            prev = all_chunks[-1]["samples"]
+            new_samples = base_samples.clone()
+            copy = min(overlap, prev.shape[2])
+            new_samples[:, :, :copy] = prev[:, :, -copy:]
+            mask = torch.ones(
+                (new_samples.shape[0], 1, new_samples.shape[2], 1, 1),
+                dtype=new_samples.dtype, device=new_samples.device,
+            )
+            mask[:, :, :copy] = 0.0
+            chunk_latent = {"samples": new_samples, "noise_mask": mask}
+
+        log.info("[LongChainSampler] Chunk %d/%d: seed=%d", i + 1, len(positives), chunk_seed)
+        sampled = nodes.common_ksampler(
+            model, chunk_seed, int(steps), float(cfg), sampler_name, scheduler,
+            positive, negative, chunk_latent, denoise=float(denoise),
+        )[0]
+        all_chunks.append(sampled)
+
+    parts = [all_chunks[0]["samples"]]
+    for chunk in all_chunks[1:]:
+        s = chunk["samples"]
+        parts.append(s[:, :, overlap:] if overlap < s.shape[2] else s)
+    final = torch.cat(parts, dim=2)
+    log.info("[LongChainSampler] Final stitched latent: %s (chunks=%d, per-chunk T=%d, overlap=%d)",
+             tuple(final.shape), len(positives), base_T, overlap)
+    return {"samples": final}
+
+
+class LongChainSampler(io.ComfyNode):
+    """Dynamic long-video sampler — set the chunk count and feed one prompt per chunk.
+
+    Unlike LongChunkSamplerMulti (capped at 6 conditioning sockets), the per-chunk
+    prompts are a multiline list — one prompt per line (`|` also separates) — so the
+    chunk count is unbounded. `num_chunks` drives how many chunks are generated:
+
+    - num_chunks = 0  → generate exactly one chunk per prompt line.
+    - num_chunks = N  → generate N chunks; if there are fewer prompt lines than N the
+      last line is held for the remaining chunks (so 1 line + N=10 = the same prompt
+      held across 10 chunks; 3 lines + N=10 = prompts 1,2,3 then 3 held).
+
+    Each chunk is seeded from the previous chunk's tail (front
+    `seed_overlap_latent_frames` locked via noise_mask) and the chunks are stitched
+    into one latent. This is the fast single-stage path; for the LTX 2-stage upscale
+    + guide quality, chain LTX Directors with prev_latent instead.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LongChainSampler",
+            display_name="Long Chain Sampler (Dynamic)",
+            category="WhatDreamsCost",
+            description=(
+                "Runs KSampler once per chunk, seeding each chunk from the previous chunk's "
+                "tail, and stitches the result into one long latent. Per-chunk prompts are a "
+                "multiline list (one per line); num_chunks sets the count (0 = one per line, "
+                "N = hold the last line for any extra chunks). Not capped by input sockets."
+            ),
+            inputs=[
+                io.Model.Input("model", tooltip="Diffusion model (a plain model — not one already patched with a prompt-relay mask for a different latent shape)."),
+                io.Clip.Input("clip", tooltip="CLIP used to encode each chunk's prompt."),
+                io.Latent.Input("latent", tooltip="Chunk-length latent template. Its temporal length is the per-chunk length; total output ≈ T × num_chunks − (num_chunks−1) × seed_overlap_latent_frames."),
+                io.String.Input(
+                    "prompts", multiline=True, default="",
+                    tooltip="Per-chunk prompts, ONE PER LINE (a '|' also splits). Chunk 1 uses line 1, chunk 2 line 2, etc.",
+                ),
+                io.String.Input(
+                    "global_prompt", multiline=True, default="", optional=True,
+                    tooltip="Optional text prepended to every chunk's prompt — anchors persistent subject / style across the whole video.",
+                ),
+                io.Conditioning.Input("negative", optional=True, tooltip="Optional negative conditioning. An empty one is built from clip if unconnected."),
+                io.Int.Input(
+                    "num_chunks", default=0, min=0, max=1000, step=1,
+                    tooltip="How many chunks to generate. 0 = one chunk per prompt line. If N exceeds the prompt-line count, the last line is held for the remaining chunks.",
+                ),
+                io.Int.Input(
+                    "seed_overlap_latent_frames", default=1, min=1, max=16, step=1,
+                    tooltip="Latent frames at the front of each chunk (after the first) locked to the previous chunk's tail. Drives continuity at every seam.",
+                ),
+                io.Int.Input("steps", default=20, min=1, max=200, step=1),
+                io.Float.Input("cfg", default=3.0, min=0.0, max=20.0, step=0.1),
+                io.Combo.Input("sampler_name", options=comfy.samplers.KSampler.SAMPLERS, default="euler"),
+                io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="normal"),
+                io.Int.Input(
+                    "seed", default=0, min=0, max=0xffffffffffffffff,
+                    tooltip="Base seed. Chunk K uses seed + K so chunks don't collapse to identical noise.",
+                ),
+                io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, clip, latent, prompts, global_prompt="", negative=None,
+                num_chunks=0, seed_overlap_latent_frames=1, steps=20, cfg=3.0,
+                sampler_name="euler", scheduler="normal", seed=0, denoise=1.0) -> io.NodeOutput:
+        # Parse the multiline prompt list ('|' also separates), dropping blank lines.
+        lines = [seg.strip() for raw in prompts.split("\n") for seg in raw.split("|") if seg.strip()]
+        if not lines:
+            raise ValueError("LongChainSampler: 'prompts' is empty — provide at least one prompt line.")
+
+        n = int(num_chunks) if int(num_chunks) > 0 else len(lines)
+        gp = global_prompt.strip()
+
+        if negative is None:
+            negative = clip.encode_from_tokens_scheduled(clip.tokenize(""))
+
+        positives = []
+        for i in range(n):
+            line = lines[min(i, len(lines) - 1)]  # hold the last line for extra chunks
+            full = f"{gp} {line}".strip() if gp else line
+            positives.append(clip.encode_from_tokens_scheduled(clip.tokenize(full)))
+
+        log.info("[LongChainSampler] %d chunk(s) from %d prompt line(s)%s",
+                 n, len(lines), " (+global)" if gp else "")
+
+        out = _sample_and_stitch_chunks(
+            model, positives, negative, latent, seed_overlap_latent_frames,
+            steps, cfg, sampler_name, scheduler, seed, denoise,
+        )
+        return io.NodeOutput(out)

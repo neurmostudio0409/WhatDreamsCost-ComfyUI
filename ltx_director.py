@@ -30,6 +30,12 @@ log = logging.getLogger(__name__)
 # Custom socket type shared with LTXSequencer
 GuideData = io.Custom("GUIDE_DATA")
 
+# How many trailing latent frames of the previous chunk to carry into the next one
+# when auto-chaining via prev_latent. Carrying a short MOTION CLIP (not a single
+# still frame) lets the model continue the existing motion instead of restarting
+# from a standstill — this is what removes the stutter at the seam.
+_CHAIN_TAIL_LATENT_FRAMES = 2
+
 
 def _load_image_tensor(seg: dict) -> torch.Tensor:
     """Decode an image from the ComfyUI input folder (if imageFile provided) or fallback to base64
@@ -500,15 +506,18 @@ class LTXDirector(io.ComfyNode):
                 use_custom_audio=False, start_image=None, prev_latent=None, prev_vae=None,
                 start_image_strength=1.0) -> io.NodeOutput:  # start_image_strength not a schema widget; hard-anchored at 1.0 for chaining
 
-        # --- Auto-chain: derive start_image from the previous chunk's tail frame ---
+        # --- Auto-chain: derive start_image from the previous chunk's tail frames ---
         # When prev_latent is wired (the previous Director chunk's output video latent) and no
-        # explicit start_image is given, decode its last frame here so this chunk continues
+        # explicit start_image is given, decode its last few frames here so this chunk continues
         # seamlessly from where the last one ended — no separate Latent Tail to Image node.
+        # We carry a short MOTION CLIP (the last _CHAIN_TAIL_LATENT_FRAMES latent frames), not a
+        # single still, so the model continues the motion instead of restarting (no seam stutter).
+        start_from_prev = False
         if start_image is None and prev_latent is not None:
             if prev_vae is None:
                 raise ValueError(
                     "LTX Director: prev_latent is connected but prev_vae is not. Connect the "
-                    "video VAE to prev_vae so the previous chunk's tail frame can be decoded."
+                    "video VAE to prev_vae so the previous chunk's tail frames can be decoded."
                 )
             prev_samples = prev_latent["samples"]
             if prev_samples.dim() != 5:
@@ -516,14 +525,17 @@ class LTXDirector(io.ComfyNode):
                     f"LTX Director: prev_latent must be a 5D video latent [B,C,T,H,W], got shape "
                     f"{tuple(prev_samples.shape)}."
                 )
-            tail = prev_samples[:, :, -1:].contiguous()
+            k = min(_CHAIN_TAIL_LATENT_FRAMES, prev_samples.shape[2])
+            tail = prev_samples[:, :, -k:].contiguous()
             decoded = prev_vae.decode(tail)
             if decoded.dim() == 5:  # [B,T,H,W,C] -> drop batch
                 decoded = decoded[0]
             start_image = decoded
+            start_from_prev = True
             log.info(
-                "[PromptRelay] Auto-derived start_image from prev_latent tail: %s -> image %s",
-                tuple(prev_samples.shape), tuple(decoded.shape),
+                "[PromptRelay] Auto-derived start motion clip from prev_latent tail: %s "
+                "(%d latent frames) -> %d pixel frames",
+                tuple(prev_samples.shape), k, decoded.shape[0],
             )
 
         # --- Build guide_data from image segments FIRST (to derive output dimensions) ---
@@ -604,7 +616,14 @@ class LTXDirector(io.ComfyNode):
             # front of the guide list; it also defines the output canvas (overrides derived dims)
             # and suppresses the text-to-video dummy frame below.
             if start_image is not None and start_image.numel() > 0:
-                start_tensor = prep_image(start_image[-1:])  # last frame = the true continuation point
+                if start_from_prev and start_image.shape[0] > 1:
+                    # Multi-frame motion prefix from the previous chunk: keep ALL frames so LTX
+                    # extends the existing motion across the seam instead of restarting from a still.
+                    start_tensor = torch.cat(
+                        [prep_image(start_image[i:i + 1]) for i in range(start_image.shape[0])], dim=0
+                    )
+                else:
+                    start_tensor = prep_image(start_image[-1:])  # last frame = the continuation point
                 derived_h = start_tensor.shape[1]
                 derived_w = start_tensor.shape[2]
                 guide_data["images"].insert(0, start_tensor)

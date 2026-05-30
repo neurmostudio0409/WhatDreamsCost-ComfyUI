@@ -36,6 +36,7 @@ from .ltx_director import (
     _load_image_tensor,
     _resize_image,
     _convert_to_latent_lengths,
+    _CHAIN_TAIL_LATENT_FRAMES,
 )
 
 log = logging.getLogger(__name__)
@@ -372,16 +373,18 @@ class WanDirector(io.ComfyNode):
         # --- Resolve start_image / end_image from timeline image segments ---
         img_segs = _extract_image_segments(timeline_data, duration_frames)
 
-        # --- Auto-chain: derive a start image from the previous chunk's tail frame ---
-        # When prev_latent is wired and the timeline has no image segment, decode the
-        # previous chunk's last frame so this chunk continues seamlessly from it. This
+        # --- Auto-chain: derive a start motion clip from the previous chunk's tail ---
+        # When prev_latent is wired and the timeline has no image segment, decode the previous
+        # chunk's last few frames so this chunk continues seamlessly from it. We carry a short
+        # MOTION CLIP (the last _CHAIN_TAIL_LATENT_FRAMES latent frames), not a single still, so
+        # the model continues the existing motion instead of restarting (no seam stutter). This
         # counts as one image segment, so the variant resolves to an image-to-video mode.
         prev_start = None
         if prev_latent is not None and len(img_segs) == 0:
             if vae is None:
                 raise ValueError(
                     "WanDirector: prev_latent is connected but no vae. Connect the Wan VAE so "
-                    "the previous chunk's tail frame can be decoded."
+                    "the previous chunk's tail frames can be decoded."
                 )
             prev_samples = prev_latent["samples"]
             if prev_samples.dim() != 5:
@@ -389,12 +392,14 @@ class WanDirector(io.ComfyNode):
                     f"WanDirector: prev_latent must be a 5D video latent [B,C,T,H,W], got shape "
                     f"{tuple(prev_samples.shape)}."
                 )
-            decoded = vae.decode(prev_samples[:, :, -1:].contiguous())
+            k = min(_CHAIN_TAIL_LATENT_FRAMES, prev_samples.shape[2])
+            decoded = vae.decode(prev_samples[:, :, -k:].contiguous())
             if decoded.dim() == 5:  # [B,T,H,W,C] -> drop batch
                 decoded = decoded[0]
-            prev_start = decoded[-1:]  # last pixel frame = the true continuation point
-            log.info("[WanDirector] Auto-derived start image from prev_latent tail: %s -> %s",
-                     tuple(prev_samples.shape), tuple(prev_start.shape))
+            prev_start = decoded  # multi-frame motion clip placed at the front (masked by I2V/FLF)
+            log.info("[WanDirector] Auto-derived start motion clip from prev_latent tail: %s "
+                     "(%d latent frames) -> %d pixel frames",
+                     tuple(prev_samples.shape), k, prev_start.shape[0])
 
         effective_img_count = len(img_segs) + (1 if prev_start is not None else 0)
         variant = _resolve_variant(model_variant, geom, effective_img_count)
@@ -425,9 +430,11 @@ class WanDirector(io.ComfyNode):
         start_image = _load_seg(img_segs[0]) if len(img_segs) >= 1 else None
         end_image = _load_seg(img_segs[-1]) if len(img_segs) >= 2 else None
 
-        # No timeline start image but a previous-chunk tail was decoded → use it as the start.
+        # No timeline start image but a previous-chunk tail clip was decoded → use it as the start.
+        # Keep all frames (multi-frame motion prefix); the I2V/FLF/TI2V conditioning upscales the
+        # clip to the target size itself, so we don't collapse it to a single frame here.
         if start_image is None and prev_start is not None:
-            start_image = _resize_and_normalize(prev_start, tgt_w, tgt_h, divisible_by, resize_method)
+            start_image = prev_start
 
         # Use the (possibly snapped from image) resolved dims for latent generation
         if start_image is not None:
