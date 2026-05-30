@@ -389,6 +389,16 @@ class LTXDirector(io.ComfyNode):
                 io.Clip.Input("clip"),
                 io.Vae.Input("audio_vae", optional=True, tooltip="Optional. Connect an Audio VAE to generate audio latents."),
                 io.Latent.Input("optional_latent", optional=True, tooltip="Optional. Connect a latent to override the auto-generated one."),
+                io.Image.Input(
+                    "start_image", optional=True,
+                    tooltip=(
+                        "Optional start keyframe injected as a frame-0 guide. Use this to chain "
+                        "30s chunks into a longer video: feed the previous chunk's tail frame "
+                        "(LatentTailToImage output) here so this chunk continues seamlessly from it. "
+                        "When connected it defines the output canvas size and skips the text-to-video "
+                        "dummy frame."
+                    ),
+                ),
                 io.String.Input(
                     "global_prompt", multiline=True, default="",
                     tooltip="Conditions the entire video. Anchors persistent characters, objects, and scene context.",
@@ -456,6 +466,10 @@ class LTXDirector(io.ComfyNode):
                     "img_compression", default=18, min=0, max=100, step=1, optional=True,
                     tooltip="H.264 CRF compression to apply to each guide image. 0 = no compression, higher = more artefacts.",
                 ),
+                io.Float.Input(
+                    "start_image_strength", default=1.0, min=0.0, max=1.0, step=0.01, optional=True,
+                    tooltip="Guide strength of the start_image keyframe (only used when start_image is connected). 1.0 anchors the first frame hard for the smoothest chunk-to-chunk continuity.",
+                ),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -474,7 +488,7 @@ class LTXDirector(io.ComfyNode):
                 frame_rate=24, display_mode="seconds",
                 custom_width=768, custom_height=512, resize_method="maintain aspect ratio",
                 divisible_by=32, img_compression=0, audio_vae=None, optional_latent=None,
-                use_custom_audio=False) -> io.NodeOutput:
+                use_custom_audio=False, start_image=None, start_image_strength=1.0) -> io.NodeOutput:
 
         # --- Build guide_data from image segments FIRST (to derive output dimensions) ---
         guide_data = {"images": [], "insert_frames": [], "strengths": [], "frame_rate": frame_rate}
@@ -493,10 +507,9 @@ class LTXDirector(io.ComfyNode):
             if guide_strength.strip():
                 strengths = [float(x.strip()) for x in guide_strength.split(",") if x.strip()]
 
-            for idx, seg in enumerate(img_segs):
-                tensor = _load_image_tensor(seg)
-
-                # Apply resize
+            def prep_image(tensor):
+                """Resize (per custom_width/height/resize_method) then optionally compress a
+                [1,H,W,3] guide image. Shared by timeline segments and the start_image keyframe."""
                 src_h, src_w = tensor.shape[1], tensor.shape[2]
 
                 def snap(val, div):
@@ -519,10 +532,13 @@ class LTXDirector(io.ComfyNode):
                     # Both zero — keep original dimensions, just snap to divisible_by
                     tensor = _resize_image(tensor, src_w, src_h, "maintain aspect ratio", divisible_by)
 
-
                 # Apply compression
                 if img_compression > 0:
                     tensor = _compress_image(tensor, img_compression)
+                return tensor
+
+            for idx, seg in enumerate(img_segs):
+                tensor = prep_image(_load_image_tensor(seg))
 
                 # Record dimensions of the first processed image for latent generation
                 if idx == 0:
@@ -546,7 +562,20 @@ class LTXDirector(io.ComfyNode):
                 guide_data["insert_frames"].append(int(seg["start"]))
                 guide_data["strengths"].append(float(strength))
                 guide_data.setdefault("hold_pixel_frames", []).append(hold_pixel_frames)
-            
+
+            # start_image: inject the previous chunk's tail frame as a hard frame-0 keyframe so
+            # this chunk continues seamlessly from where the last one ended. Prepended to the
+            # front of the guide list; it also defines the output canvas (overrides derived dims)
+            # and suppresses the text-to-video dummy frame below.
+            if start_image is not None and start_image.numel() > 0:
+                start_tensor = prep_image(start_image[-1:])  # last frame = the true continuation point
+                derived_h = start_tensor.shape[1]
+                derived_w = start_tensor.shape[2]
+                guide_data["images"].insert(0, start_tensor)
+                guide_data["insert_frames"].insert(0, 0)
+                guide_data["strengths"].insert(0, float(start_image_strength))
+                guide_data.setdefault("hold_pixel_frames", []).insert(0, 1)
+
             # If no images were loaded from the timeline, create a dummy image at strength 0
             # to prevent artifacts in text-to-video mode.
             if not guide_data["images"]:

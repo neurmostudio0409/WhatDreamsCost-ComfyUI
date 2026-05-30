@@ -75,9 +75,27 @@ def _concat_latents(latents, overlap_frames, blend_mode="drop"):
         raise ValueError("LongVideoStitcher: no latents to stitch.")
 
     samples_list = [lat["samples"] for lat in latents]
+    ref = samples_list[0]
+
+    # Audio latents are 4D [B, C, T, F] and have no spatial axes to crossfade — just
+    # concatenate them along the temporal axis (dim=2). Each chunk's audio was sampled
+    # independently (no seeded overlap the way video chunks share their boundary frame),
+    # so there is nothing to drop or blend; the full audio of every chunk is kept.
+    if ref.dim() == 4:
+        for i, s in enumerate(samples_list[1:], start=1):
+            if (s.shape[0], s.shape[1], s.shape[3]) != (ref.shape[0], ref.shape[1], ref.shape[3]):
+                raise ValueError(
+                    f"LongVideoStitcher: audio chunk {i + 1} shape {tuple(s.shape)} does not "
+                    f"match chunk 1 shape {tuple(ref.shape)} (batch / channels / freq-bins must agree)."
+                )
+        combined = torch.cat(samples_list, dim=2)
+        log.info(
+            "[LongVideoStitcher] Concatenated %d audio latents -> %s",
+            len(latents), tuple(combined.shape),
+        )
+        return {"samples": combined, "type": latents[0].get("type", "audio")}
 
     # Sanity-check shapes match on B / C / H / W.
-    ref = samples_list[0]
     for i, s in enumerate(samples_list[1:], start=1):
         if (s.shape[0], s.shape[1], s.shape[3], s.shape[4]) != \
            (ref.shape[0], ref.shape[1], ref.shape[3], ref.shape[4]):
@@ -152,7 +170,9 @@ class LongVideoStitcher(io.ComfyNode):
                 "blend_mode=drop trims the trailing overlap_frames of each preceding "
                 "chunk; blend_mode=linear/cosine crossfades the overlap region across "
                 "each seam for a smoother boundary. Channels / spatial dims of all "
-                "chunks must match."
+                "chunks must match. Also accepts 4D audio latents ([B,C,T,F]) — those "
+                "are plainly concatenated (overlap_frames / blend_mode are ignored) so "
+                "you can stitch the matching audio of chained chunks with a second instance."
             ),
             inputs=[
                 io.Latent.Input("latent_1", tooltip="First chunk (required)."),

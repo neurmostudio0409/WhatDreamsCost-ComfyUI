@@ -37,6 +37,12 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.10.0**
+  * **Long-video chaining — smoothly stitch multiple 30s LTX clips into one**
+    * **New `start_image` input on LTX Director.** Connect an image (e.g. the previous chunk's tail frame) and it is injected as a hard frame-0 keyframe, so the next chunk continues seamlessly from where the last one ended. It also defines the output canvas and skips the text-to-video dummy frame. A `start_image_strength` widget controls how hard the first frame is anchored.
+    * **`Long Video Stitcher` now also stitches audio latents.** 4D audio latents (`[B,C,T,F]`) are plainly concatenated (overlap / blend ignored), so the chained chunks' audio can be combined alongside the cosine-blended video.
+    * **New example workflow: `LTX Director Long Video (2x30s Chain) v1`.** Two `LTX Director → Stage #1 → Stage #2` chains bridged by `Latent Tail to Image` (chunk 1's tail → chunk 2's `start_image`), with the two chunks' video latents cosine-blended and audio latents concatenated before a single Decode → a 60s video. Extend to more chunks by duplicating the chain (up to 6 per stitcher). The pattern works around LTX having no native `frame_offset`.
+
 **v1.4.0**
   * **Wan2.2 family support — four new Director nodes**
     * **Wan Director** — T2V-A14B / I2V-A14B (MoE 14B, two model inputs), FLF-14B, TI2V-5B. Auto-detects Wan2.1 vs Wan2.2 latent format from the model.
