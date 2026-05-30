@@ -396,8 +396,21 @@ class LTXDirector(io.ComfyNode):
                         "30s chunks into a longer video: feed the previous chunk's tail frame "
                         "(LatentTailToImage output) here so this chunk continues seamlessly from it. "
                         "When connected it defines the output canvas size and skips the text-to-video "
-                        "dummy frame."
+                        "dummy frame. Takes priority over prev_latent."
                     ),
+                ),
+                io.Latent.Input(
+                    "prev_latent", optional=True,
+                    tooltip=(
+                        "Optional. Connect the PREVIOUS chunk's output video latent to auto-chain: "
+                        "the Director decodes its last frame (via prev_vae) and uses it as this "
+                        "chunk's start keyframe — no separate Latent Tail to Image node needed. "
+                        "Ignored when start_image is connected."
+                    ),
+                ),
+                io.Vae.Input(
+                    "prev_vae", optional=True,
+                    tooltip="Video VAE used to decode prev_latent's tail frame. Required when prev_latent is connected.",
                 ),
                 io.String.Input(
                     "global_prompt", multiline=True, default="",
@@ -484,8 +497,34 @@ class LTXDirector(io.ComfyNode):
                 frame_rate=24, display_mode="seconds",
                 custom_width=768, custom_height=512, resize_method="maintain aspect ratio",
                 divisible_by=32, img_compression=0, audio_vae=None, optional_latent=None,
-                use_custom_audio=False, start_image=None,
-                start_image_strength=1.0) -> io.NodeOutput:  # not a schema widget; hard-anchored at 1.0 for chaining
+                use_custom_audio=False, start_image=None, prev_latent=None, prev_vae=None,
+                start_image_strength=1.0) -> io.NodeOutput:  # start_image_strength not a schema widget; hard-anchored at 1.0 for chaining
+
+        # --- Auto-chain: derive start_image from the previous chunk's tail frame ---
+        # When prev_latent is wired (the previous Director chunk's output video latent) and no
+        # explicit start_image is given, decode its last frame here so this chunk continues
+        # seamlessly from where the last one ended — no separate Latent Tail to Image node.
+        if start_image is None and prev_latent is not None:
+            if prev_vae is None:
+                raise ValueError(
+                    "LTX Director: prev_latent is connected but prev_vae is not. Connect the "
+                    "video VAE to prev_vae so the previous chunk's tail frame can be decoded."
+                )
+            prev_samples = prev_latent["samples"]
+            if prev_samples.dim() != 5:
+                raise ValueError(
+                    f"LTX Director: prev_latent must be a 5D video latent [B,C,T,H,W], got shape "
+                    f"{tuple(prev_samples.shape)}."
+                )
+            tail = prev_samples[:, :, -1:].contiguous()
+            decoded = prev_vae.decode(tail)
+            if decoded.dim() == 5:  # [B,T,H,W,C] -> drop batch
+                decoded = decoded[0]
+            start_image = decoded
+            log.info(
+                "[PromptRelay] Auto-derived start_image from prev_latent tail: %s -> image %s",
+                tuple(prev_samples.shape), tuple(decoded.shape),
+            )
 
         # --- Build guide_data from image segments FIRST (to derive output dimensions) ---
         guide_data = {"images": [], "insert_frames": [], "strengths": [], "frame_rate": frame_rate}

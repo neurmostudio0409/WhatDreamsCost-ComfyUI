@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.11.0**
+  * **LTX Director auto-chaining — `prev_latent` / `prev_vae` inputs.** Connect the previous chunk's output video latent to `prev_latent` (and the video VAE to `prev_vae`) and the Director automatically decodes its tail frame and uses it as this chunk's start keyframe. No more manually wiring a `Latent Tail to Image` node between chunks — just `Director → Director`. An explicit `start_image` still takes priority. The `2x30s Chain` example workflow now uses this auto-chain wiring.
+
 **v1.10.0**
   * **Long-video chaining — smoothly stitch multiple 30s LTX clips into one**
     * **New `start_image` input on LTX Director.** Connect an image (e.g. the previous chunk's tail frame) and it is injected as a hard frame-0 keyframe, so the next chunk continues seamlessly from where the last one ended. It also defines the output canvas and skips the text-to-video dummy frame. A `start_image_strength` widget controls how hard the first frame is anchored.

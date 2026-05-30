@@ -2,7 +2,7 @@
   "id": "c92620ea-60b4-4f41-a78f-621383a62c2a",
   "revision": 0,
   "last_node_id": 103,
-  "last_link_id": 277,
+  "last_link_id": 279,
   "nodes": [
     {
       "id": 46,
@@ -273,9 +273,9 @@
             222,
             237,
             247,
-            255,
             259,
-            267
+            267,
+            279
           ]
         }
       ],
@@ -483,8 +483,8 @@
           "name": "latent",
           "type": "LATENT",
           "links": [
-            254,
-            272
+            272,
+            278
           ]
         }
       ],
@@ -561,7 +561,17 @@
         {
           "name": "start_image",
           "type": "IMAGE",
-          "link": 256
+          "link": null
+        },
+        {
+          "name": "prev_latent",
+          "type": "LATENT",
+          "link": 278
+        },
+        {
+          "name": "prev_vae",
+          "type": "VAE",
+          "link": 279
         }
       ],
       "outputs": [
@@ -833,50 +843,6 @@
       "bgcolor": "#000"
     },
     {
-      "id": 100,
-      "type": "LatentTailToImage",
-      "pos": [
-        1500,
-        4960
-      ],
-      "size": [
-        300,
-        110
-      ],
-      "flags": {},
-      "order": 0,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "latent",
-          "type": "LATENT",
-          "link": 254
-        },
-        {
-          "name": "vae",
-          "type": "VAE",
-          "link": 255
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": [
-            256
-          ]
-        }
-      ],
-      "properties": {
-        "cnr_id": "whatdreamscost-comfyui",
-        "Node name for S&R": "LatentTailToImage"
-      },
-      "title": "Chunk1 tail -> Chunk2 start",
-      "widgets_values": [
-        1
-      ]
-    },
-    {
       "id": 101,
       "type": "LongVideoStitcher",
       "pos": [
@@ -1027,7 +993,7 @@
       "color": "#223",
       "bgcolor": "#335",
       "widgets_values": [
-        "# 長影片串接 (2×30s → 60s)\n\n把單段 LTX 影片串成長片，過渡用「尾幀橋接 + cosine 混合」。\n\n**資料流**\n- **Chunk 1** = 原本的 Director → Stage #1 → Stage #2\n- **Chunk1 tail → Chunk2 start** (Latent Tail to Image)：把第一段最後一幀解碼成圖，餵進第二段 Director 的 start_image 輸入，讓第二段從第一段結尾無縫接續\n- **Stitch video (cosine)**：兩段影片潛空間以 cosine、overlap=2 混合接縫\n- **Stitch audio**：兩段音訊潛空間直接相接\n- 單一 **Decode** 解出 60 秒影片\n\n**使用步驟**\n1. 在「兩個」LTX Director 的時間軸各放 prompt（至少 1 段 local prompt）。第一段可放起始圖；第二段不用（自動用第一段尾幀）。\n2. 兩個 Director 的 custom_width 都已設 768。要改解析度請「兩個一起改」，否則接縫會因尺寸不符報錯。\n3. 想要更多段：複製 Director+Stage#1+Stage#2，一樣用 Latent Tail to Image 串接，接到 Stitch video / audio 的 latent_3.. (最多 6 段)。\n4. 接縫若有輕微重影，把 Stitch video 的 blend_mode 改成 drop。\n\n注意：cosine 會吃掉接縫 2 個 latent frame，音訊為直接相接，故音訊比影片長約 0.6 秒，屬正常。"
+        "# 長影片串接 (2×30s → 60s)\n\n把單段 LTX 影片串成長片，過渡用「自動尾幀橋接 + cosine 混合」。\n\n**資料流**\n- **Chunk 1** = Director → Stage #1 → Stage #2\n- **Chunk 2 自動接續**：第二段 Director 的 prev_latent 接第一段輸出 latent、prev_vae 接 Video VAE。Director 會自動解碼第一段尾幀當本段起始幀，不需 Latent Tail to Image 節點。\n- **Stitch video (cosine)**：兩段影片潛空間以 cosine、overlap=2 混合接縫\n- **Stitch audio**：兩段音訊潛空間直接相接\n- 單一 **Decode** 輸出 60 秒\n\n**使用步驟**\n1. 在「兩個」LTX Director 的時間軸各放 prompt（至少 1 段 local prompt）。第一段可放起始圖；第二段不用（自動接尾幀）。\n2. 兩個 Director 的 custom_width 都已設 768。要改解析度請「兩個一起改」，否則接縫尺寸不符會報錯。\n3. 想要更多段：複製 Director+Stage#1+Stage#2，把上一段 Stage#2 的 latent 接到下一段 Director 的 prev_latent、Video VAE 接 prev_vae，輸出再接到 Stitch video / audio 的 latent_3..（最多 6 段）。\n4. 接縫若有輕微重影，把 Stitch video 的 blend_mode 改成 drop。\n\n注意：cosine 會吃掉影片 2 個 latent frame，音訊為直接相接，故音訊比影片長約 0.6 秒，屬正常。"
       ]
     }
   ],
@@ -1233,30 +1199,6 @@
       "VAE"
     ],
     [
-      254,
-      95,
-      1,
-      100,
-      0,
-      "LATENT"
-    ],
-    [
-      255,
-      93,
-      3,
-      100,
-      1,
-      "VAE"
-    ],
-    [
-      256,
-      100,
-      0,
-      97,
-      4,
-      "IMAGE"
-    ],
-    [
       257,
       97,
       0,
@@ -1423,6 +1365,22 @@
       96,
       0,
       "LATENT"
+    ],
+    [
+      278,
+      95,
+      1,
+      97,
+      5,
+      "LATENT"
+    ],
+    [
+      279,
+      93,
+      3,
+      97,
+      6,
+      "VAE"
     ]
   ],
   "groups": [],
