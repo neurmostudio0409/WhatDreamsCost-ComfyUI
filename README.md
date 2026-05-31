@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.24.1**
+  * **`LTX Smooth Transition`: tidier input order.** Inputs are now grouped logically — loaders (`model`, `clip`, `video_vae`, `audio_vae`) → video chunks (`video_latent_*`) → audio chunks (`audio_latent_*`) → transition controls (`transition_frames`, `prompt`, `strength`) → sampler controls (`steps`, `cfg`, `sampler_name`, `scheduler`, `seed`) → audio-bridge fine-tuning (`frame_rate`, `audio_blend`). The audio-bridge params no longer sit in the middle of the sampler settings.
+
 **v1.24.0**
   * **`LTX Smooth Transition`: paired per-chunk video + audio inputs.** The dynamic video inputs were renamed `latent_1..N` → **`video_latent_1..N`**, and a matching dynamic **`audio_latent_1..N`** group was added (both grow/shrink as you wire them). Connect each chunk's audio to the same-numbered slot and the node inserts an equal-length crossfade bridge into the audio at every seam (sized via `audio_vae`/`frame_rate` if connected, else the per-chunk audio:video ratio), so the audio stays in sync with the lengthened video. Audio inputs are optional (leave them empty for video-only). **Reconnect the video inputs after updating — they were renamed.**
 

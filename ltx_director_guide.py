@@ -164,6 +164,12 @@ class LTXSmoothTransition(LTXVAddGuide):
                     "strength", default=1.0, min=0.0, max=1.0, step=0.01, optional=True,
                     tooltip="How hard each transition is anchored to the two boundary frames (1.0 = exact endpoints).",
                 ),
+                io.Int.Input("steps", default=20, min=1, max=200, step=1, optional=True),
+                io.Float.Input("cfg", default=3.0, min=0.0, max=20.0, step=0.1, optional=True),
+                io.Combo.Input("sampler_name", options=comfy.samplers.KSampler.SAMPLERS, default="euler", optional=True),
+                io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="normal", optional=True),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff, optional=True),
+                # Audio-bridge fine-tuning (only matters when audio_latent_* is connected).
                 io.Int.Input(
                     "frame_rate", default=24, min=1, max=120, step=1, optional=True,
                     tooltip="Video FPS — only used (with audio_vae) to size the inserted audio bridges.",
@@ -172,11 +178,6 @@ class LTXSmoothTransition(LTXVAddGuide):
                     "audio_blend", options=["cosine", "linear"], default="cosine", optional=True,
                     tooltip="Crossfade curve for each inserted audio bridge (chunk A tail audio → chunk B head audio).",
                 ),
-                io.Int.Input("steps", default=20, min=1, max=200, step=1, optional=True),
-                io.Float.Input("cfg", default=3.0, min=0.0, max=20.0, step=0.1, optional=True),
-                io.Combo.Input("sampler_name", options=comfy.samplers.KSampler.SAMPLERS, default="euler", optional=True),
-                io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="normal", optional=True),
-                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff, optional=True),
             ],
             outputs=[
                 io.Latent.Output(display_name="video_latent"),
