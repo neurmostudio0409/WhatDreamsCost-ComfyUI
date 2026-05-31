@@ -14,47 +14,52 @@ const MAX_LATENTS = 12;
 const MIN_VISIBLE = 2; // always show at least latent_1 + one spare
 // Nodes that expose dynamic latent_1..latent_12 inputs.
 const DYNAMIC_LATENT_NODES = ["LongVideoStitcher", "SmoothVideoStitcher", "SmoothAudioStitcher", "LTXSmoothTransition"];
+// LTX Smooth Transition also has a parallel optional audio_1..12 group.
+function dynamicGroupsFor(comfyClass) {
+    const groups = [{ prefix: "latent_", min: MIN_VISIBLE }];
+    if (comfyClass === "LTXSmoothTransition") groups.push({ prefix: "audio_", min: 1 });
+    return groups;
+}
 
-function latentIndex(name) {
-    const m = /^latent_(\d+)$/.exec(name || "");
+function groupIndex(name, prefix) {
+    const m = new RegExp("^" + prefix + "(\\d+)$").exec(name || "");
     return m ? parseInt(m[1], 10) : null;
+}
+
+// Grow/shrink one prefixed input group (e.g. "latent_" or "audio_") to the
+// connected slots + one spare, clamped to [minVisible, MAX_LATENTS].
+function syncGroup(node, prefix, minVisible) {
+    const inputs = node.inputs || [];
+
+    let maxConnected = 0;
+    for (const inp of inputs) {
+        const idx = groupIndex(inp.name, prefix);
+        if (idx != null && inp.link != null && idx > maxConnected) maxConnected = idx;
+    }
+    const desired = Math.min(MAX_LATENTS, Math.max(minVisible, maxConnected + 1));
+
+    let visible = 0;
+    for (const inp of inputs) if (groupIndex(inp.name, prefix) != null) visible++;
+
+    while (visible < desired) {
+        visible++;
+        node.addInput(`${prefix}${visible}`, "LATENT");
+    }
+
+    // Remove trailing UNCONNECTED slots above `desired` (never touch a linked slot or slot 1).
+    for (let i = node.inputs.length - 1; i >= 0; i--) {
+        const inp = node.inputs[i];
+        const idx = groupIndex(inp.name, prefix);
+        if (idx == null) continue;
+        if (idx > desired && idx > 1 && inp.link == null) {
+            node.removeInput(i);
+        }
+    }
 }
 
 function syncLatentInputs(node) {
     try {
-        const inputs = node.inputs || [];
-
-        // Highest latent index that currently has a connection.
-        let maxConnected = 0;
-        for (const inp of inputs) {
-            const idx = latentIndex(inp.name);
-            if (idx != null && inp.link != null && idx > maxConnected) maxConnected = idx;
-        }
-
-        // Show connected slots + one spare, clamped to [MIN_VISIBLE, MAX_LATENTS].
-        const desired = Math.min(MAX_LATENTS, Math.max(MIN_VISIBLE, maxConnected + 1));
-
-        // How many latent slots are visible now?
-        let visible = 0;
-        for (const inp of inputs) if (latentIndex(inp.name) != null) visible++;
-
-        // Add missing trailing slots.
-        while (visible < desired) {
-            visible++;
-            node.addInput(`latent_${visible}`, "LATENT");
-        }
-
-        // Remove trailing UNCONNECTED slots above `desired` (never touch a linked slot
-        // or latent_1).
-        for (let i = node.inputs.length - 1; i >= 0; i--) {
-            const inp = node.inputs[i];
-            const idx = latentIndex(inp.name);
-            if (idx == null) continue;
-            if (idx > desired && idx > 1 && inp.link == null) {
-                node.removeInput(i);
-            }
-        }
-
+        for (const g of dynamicGroupsFor(node.comfyClass)) syncGroup(node, g.prefix, g.min);
         if (node.graph) app.graph.setDirtyCanvas(true, true);
     } catch (e) {
         console.error("[LongVideoStitcher] dynamic input sync failed (falling back to static slots):", e);

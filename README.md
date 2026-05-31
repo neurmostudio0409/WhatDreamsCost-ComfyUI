@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.23.0**
+  * **`LTX Smooth Transition` now handles audio too (keeps A/V in sync).** Inserting a generated video transition makes the video longer, so the audio has to grow by the same amount or it drifts out of sync. The node now has an optional `audio_vae` + `audio_1..N` latent inputs and a second `audio_latent` output: at each seam it inserts an audio bridge of the matching duration (a cosine/linear crossfade from chunk A's tail to chunk B's head). The bridge length is sized from `audio_vae` (`num_of_latents_from_frames`, using `frame_rate`) when connected, otherwise from the chunk's audio:video frame ratio. Leave the audio inputs unconnected to use it video-only. The `audio_1..N` slots grow/shrink dynamically like the latent slots.
+
 **v1.22.2**
   * **`LTX Smooth Transition`: `vae` input renamed to `video_vae`.** LTX uses separate video and audio VAEs; this node only touches video frames, so the input is now clearly the **VIDEO** VAE (it never needs the audio VAE). Audio is not handled here — stitch the matching audio separately with `Smooth Audio Stitcher` (which needs no VAE). Reconnect the VAE input after updating.
 
