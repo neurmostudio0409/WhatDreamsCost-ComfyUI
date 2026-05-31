@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.23.2**
+  * **`LTX Smooth Transition` fix: FLF keyframe encode used the wrong (pixel) size.** The keyframe encode was passed pixel dimensions instead of the latent width/height, so the encoded keyframe came out at the wrong spatial size — causing a giant VAE encode (the "ran out of memory → tiled" warning) and then a `torch.cat` size-mismatch crash (`Expected size 48 but got size 1536`). It now passes the latent dims, so the encode is correct and light. Also frees VRAM (`soft_empty_cache`) before each seam, and removed the `audio_latent` input (video chunks go through the dynamic `latent_1..N`; stitch audio separately with `Smooth Audio Stitcher`).
+
 **v1.23.0**
   * **`LTX Smooth Transition` now handles audio too (keeps A/V in sync).** Inserting a generated video transition makes the video longer, so the audio has to grow by the same amount or it drifts out of sync. The node takes one optional combined **`audio_latent`** input (matching your chunks' total duration before transitions) plus an optional `audio_vae`, and outputs a second `audio_latent`: at each video seam it inserts a matching-length audio bridge (cosine/linear crossfade across the seam) so audio and video stay aligned. The bridge length is sized from `audio_vae` (`num_of_latents_from_frames`, using `frame_rate`) when connected, otherwise from the audio:video frame ratio. Leave `audio_latent` unconnected to use the node video-only.
 

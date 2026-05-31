@@ -1,5 +1,4 @@
 import logging
-import math
 
 from comfy_extras.nodes_lt import LTXVAddGuide
 import torch
@@ -143,7 +142,6 @@ class LTXSmoothTransition(LTXVAddGuide):
                 io.Vae.Input("video_vae", tooltip="LTX VIDEO VAE. Decodes each chunk's boundary frame and re-encodes it as an FLF keyframe for the generated video transition."),
                 io.Vae.Input("audio_vae", optional=True, tooltip="LTX AUDIO VAE. Only needed if you connect audio_latent — used to size each inserted audio bridge to match the video transition's duration. If omitted, the audio:video frame ratio is used instead."),
                 *latent_inputs,
-                io.Latent.Input("audio_latent", optional=True, tooltip="Optional. The combined AUDIO latent matching your chunks' total duration (before transitions). The node inserts a matching-length crossfade bridge at each seam so the audio stays in sync with the lengthened video, and outputs the result on audio_latent."),
                 io.Int.Input(
                     "transition_frames", default=25, min=5, max=257, step=1, optional=True,
                     tooltip="Pixel-frame length of each GENERATED video transition between chunks. Longer = more room for smooth motion.",
@@ -155,14 +153,6 @@ class LTXSmoothTransition(LTXVAddGuide):
                 io.Float.Input(
                     "strength", default=1.0, min=0.0, max=1.0, step=0.01, optional=True,
                     tooltip="How hard each transition is anchored to the two boundary frames (1.0 = exact endpoints).",
-                ),
-                io.Int.Input(
-                    "frame_rate", default=24, min=1, max=120, step=1, optional=True,
-                    tooltip="Video FPS — only used (with audio_vae) to size the inserted audio bridges so audio stays in sync with the lengthened video.",
-                ),
-                io.Combo.Input(
-                    "audio_blend", options=["cosine", "linear"], default="cosine", optional=True,
-                    tooltip="Crossfade curve for the inserted audio bridge (A's tail audio → B's head audio).",
                 ),
                 io.Int.Input("steps", default=20, min=1, max=200, step=1, optional=True),
                 io.Float.Input("cfg", default=3.0, min=0.0, max=20.0, step=0.1, optional=True),
@@ -180,8 +170,8 @@ class LTXSmoothTransition(LTXVAddGuide):
     def execute(cls, model, clip, video_vae, latent_1, latent_2=None, latent_3=None, latent_4=None,
                 latent_5=None, latent_6=None, latent_7=None, latent_8=None, latent_9=None,
                 latent_10=None, latent_11=None, latent_12=None,
-                audio_latent=None, audio_vae=None, transition_frames=25, prompt="", strength=1.0,
-                frame_rate=24, audio_blend="cosine", steps=20, cfg=3.0, sampler_name="euler",
+                audio_vae=None, transition_frames=25, prompt="", strength=1.0,
+                steps=20, cfg=3.0, sampler_name="euler",
                 scheduler="normal", seed=0) -> io.NodeOutput:
         ordered = [latent_1, latent_2, latent_3, latent_4, latent_5, latent_6,
                    latent_7, latent_8, latent_9, latent_10, latent_11, latent_12]
@@ -210,13 +200,11 @@ class LTXSmoothTransition(LTXVAddGuide):
 
         # One chunk: nothing to bridge.
         if len(samples) == 1:
-            return io.NodeOutput(chunks[0], audio_latent if audio_latent is not None else _placeholder_audio())
+            return io.NodeOutput(chunks[0], _placeholder_audio())
 
         scale_factors = video_vae.downscale_index_formula
         time_scale = scale_factors[0]
-        _, C, _, h, w = ref.shape
-        latent_w = w * scale_factors[2]
-        latent_h = h * scale_factors[1]
+        _, C, _, h, w = ref.shape  # h, w are LATENT spatial dims
         tf_px = int(transition_frames)
         latent_t = ((tf_px - 1) // time_scale) + 1
         gp = prompt.strip()
@@ -231,6 +219,8 @@ class LTXSmoothTransition(LTXVAddGuide):
         pieces = [samples[0]]
         trans_v_lengths = []  # trimmed video-transition latent-frame count per seam
         for i in range(len(samples) - 1):
+            # Free VRAM before this seam's VAE encode + transition sample to reduce OOM risk.
+            comfy.model_management.soft_empty_cache()
             a_img = boundary_image(samples[i], take_last=True)       # chunk i's last frame
             b_img = boundary_image(samples[i + 1], take_last=False)  # chunk i+1's first frame
 
@@ -242,8 +232,10 @@ class LTXSmoothTransition(LTXVAddGuide):
             noise_mask = torch.ones([1, 1, latent_t, 1, 1], dtype=torch.float32, device=device)
 
             # FLF: image A at frame 0, image B at the last pixel frame.
+            # cls.encode expects LATENT width/height (it upscales the image internally),
+            # so pass w/h straight from the latent shape — NOT multiplied by the VAE scale.
             for img, f_idx in ((a_img, 0), (b_img, tf_px - 1)):
-                image_1, t = cls.encode(video_vae, latent_w, latent_h, img, scale_factors)
+                image_1, t = cls.encode(video_vae, w, h, img, scale_factors)
                 frame_idx, latent_idx = cls.get_latent_index(positive, latent_t, len(image_1), f_idx, scale_factors)
                 positive, negative, latent_image, noise_mask = cls.append_keyframe(
                     positive, negative, frame_idx, latent_image, noise_mask, t, float(strength), scale_factors,
@@ -270,52 +262,7 @@ class LTXSmoothTransition(LTXVAddGuide):
         )
         video_out = {"samples": combined}
 
-        # ---- Audio: lengthen the single combined audio stream to match the now-longer
-        # video by inserting a crossfade bridge at each video seam's audio position, so
-        # audio and video stay in sync. ----
-        audio_out = _placeholder_audio()
-        if audio_latent is not None:
-            a = audio_latent["samples"]
-            if a.dim() == 4:
-                a_total = a.shape[2]
-                v_total = sum(s.shape[2] for s in samples)  # pre-transition video latent frames
-                a_inner = getattr(audio_vae, "first_stage_model", audio_vae) if audio_vae is not None else None
-
-                def _bridge_len(seam_idx):
-                    Lv = trans_v_lengths[seam_idx] if seam_idx < len(trans_v_lengths) else 1
-                    if a_inner is not None and hasattr(a_inner, "num_of_latents_from_frames"):
-                        try:
-                            return max(1, int(a_inner.num_of_latents_from_frames(max(1, Lv * time_scale), float(frame_rate))))
-                        except Exception:
-                            pass
-                    return max(1, int(round(Lv * a_total / v_total))) if v_total > 0 else max(1, Lv)
-
-                def _audio_bridge(a_last, b_first, n):
-                    t_lin = torch.linspace(0.0, 1.0, n, dtype=a_last.dtype, device=a_last.device)
-                    alpha = (0.5 - 0.5 * torch.cos(math.pi * t_lin)) if audio_blend == "cosine" else t_lin
-                    alpha = alpha.view(1, 1, n, 1)
-                    return a_last * (1.0 - alpha) + b_first * alpha
-
-                a_pieces = []
-                cut = 0       # how far into the audio we've copied
-                v_cum = 0     # cumulative pre-transition video frames
-                for k in range(len(samples) - 1):
-                    v_cum += samples[k].shape[2]
-                    p = round(v_cum * a_total / v_total) if v_total > 0 else cut
-                    p = max(cut, min(a_total, p))
-                    a_pieces.append(a[:, :, cut:p])  # audio up to this seam
-                    left = a[:, :, p - 1:p] if p > 0 else a[:, :, :1]
-                    right = a[:, :, p:p + 1] if p < a_total else a[:, :, -1:]
-                    a_pieces.append(_audio_bridge(left, right, _bridge_len(k)))  # inserted bridge
-                    cut = p
-                a_pieces.append(a[:, :, cut:])  # remaining audio
-                a_combined = torch.cat([p for p in a_pieces if p.shape[2] > 0], dim=2)
-                audio_out = {"samples": a_combined, "type": audio_latent.get("type", "audio")}
-                log.info(
-                    "[LTXSmoothTransition] audio: %s -> %s (%d seam bridges)",
-                    tuple(a.shape), tuple(a_combined.shape), len(samples) - 1,
-                )
-            else:
-                audio_out = audio_latent  # not 4D audio — pass through unchanged
-
-        return io.NodeOutput(video_out, audio_out)
+        # This node generates the VIDEO transitions only. The audio_latent output is kept
+        # as a placeholder for graph compatibility — stitch the matching audio separately
+        # with Smooth Audio Stitcher.
+        return io.NodeOutput(video_out, _placeholder_audio())
