@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.22.2**
+  * **`LTX Smooth Transition`: `vae` input renamed to `video_vae`.** LTX uses separate video and audio VAEs; this node only touches video frames, so the input is now clearly the **VIDEO** VAE (it never needs the audio VAE). Audio is not handled here — stitch the matching audio separately with `Smooth Audio Stitcher` (which needs no VAE). Reconnect the VAE input after updating.
+
 **v1.22.1**
   * **`Smooth Video Stitcher` model re-gen is much faster.** It used to run the sampler over the *entire* concatenated video just to regenerate the small seam bands (cost scaled with the whole video length). It now re-samples only a small window around each seam (the band + a little context) and pastes the result back, so the cost scales with the seams, not the video length.
 

@@ -110,7 +110,8 @@ class LTXSmoothTransition(LTXVAddGuide):
 
     Reuses the same LTXVAddGuide keyframe machinery as LTX Director Guide, so it is
     LTX-specific. Connect chunks to latent_1..N (slots grow) plus the LTX model +
-    vae + clip. LTX video latents only (5D, same spatial dims / channels).
+    VIDEO vae + clip. Handles VIDEO latents only (5D, same spatial dims / channels) —
+    stitch the matching audio separately with Smooth Audio Stitcher.
     """
 
     MAX_LATENTS = 12
@@ -132,12 +133,13 @@ class LTXSmoothTransition(LTXVAddGuide):
                 "Each transition is model-generated (coherent motion) so the joins are as "
                 "smooth as a native FLF clip — unlike crossfade/seam stitching which only "
                 "dissolves. Connect chunks to latent_1..N (slots grow). Needs the LTX model + "
-                "vae + clip. LTX video latents only."
+                "VIDEO vae + clip — this node handles VIDEO latents only; stitch the matching "
+                "audio separately with Smooth Audio Stitcher (no VAE needed)."
             ),
             inputs=[
                 io.Model.Input("model", tooltip="LTX diffusion model used to generate the transitions."),
                 io.Clip.Input("clip", tooltip="LTX CLIP used to encode the (optional) transition prompt."),
-                io.Vae.Input("vae", tooltip="LTX video VAE — decodes each chunk's boundary frame and re-encodes it as an FLF keyframe."),
+                io.Vae.Input("video_vae", tooltip="LTX VIDEO VAE (not the audio VAE). Used to decode each chunk's boundary frame and re-encode it as an FLF keyframe. This node never touches audio — stitch audio separately with Smooth Audio Stitcher."),
                 *latent_inputs,
                 io.Int.Input(
                     "transition_frames", default=25, min=5, max=257, step=1, optional=True,
@@ -163,7 +165,7 @@ class LTXSmoothTransition(LTXVAddGuide):
         )
 
     @classmethod
-    def execute(cls, model, clip, vae, latent_1, latent_2=None, latent_3=None, latent_4=None,
+    def execute(cls, model, clip, video_vae, latent_1, latent_2=None, latent_3=None, latent_4=None,
                 latent_5=None, latent_6=None, latent_7=None, latent_8=None, latent_9=None,
                 latent_10=None, latent_11=None, latent_12=None, transition_frames=25,
                 prompt="", strength=1.0, steps=20, cfg=3.0, sampler_name="euler",
@@ -192,7 +194,7 @@ class LTXSmoothTransition(LTXVAddGuide):
         if len(samples) == 1:
             return io.NodeOutput(chunks[0])
 
-        scale_factors = vae.downscale_index_formula
+        scale_factors = video_vae.downscale_index_formula
         time_scale = scale_factors[0]
         _, C, _, h, w = ref.shape
         latent_w = w * scale_factors[2]
@@ -204,7 +206,7 @@ class LTXSmoothTransition(LTXVAddGuide):
 
         def boundary_image(lat, take_last):
             frame = lat[:, :, -1:].contiguous() if take_last else lat[:, :, :1].contiguous()
-            img = vae.decode(frame)
+            img = video_vae.decode(frame)
             if img.dim() == 5:  # [B,T,H,W,C] -> drop batch
                 img = img[0]
             return img[-1:] if take_last else img[:1]  # [1,H,W,3]
@@ -223,7 +225,7 @@ class LTXSmoothTransition(LTXVAddGuide):
 
             # FLF: image A at frame 0, image B at the last pixel frame.
             for img, f_idx in ((a_img, 0), (b_img, tf_px - 1)):
-                image_1, t = cls.encode(vae, latent_w, latent_h, img, scale_factors)
+                image_1, t = cls.encode(video_vae, latent_w, latent_h, img, scale_factors)
                 frame_idx, latent_idx = cls.get_latent_index(positive, latent_t, len(image_1), f_idx, scale_factors)
                 positive, negative, latent_image, noise_mask = cls.append_keyframe(
                     positive, negative, frame_idx, latent_image, noise_mask, t, float(strength), scale_factors,
