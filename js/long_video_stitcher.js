@@ -13,13 +13,17 @@ import { app } from "../../scripts/app.js";
 const MAX_LATENTS = 12;
 const MIN_VISIBLE = 2; // always show at least latent_1 + one spare
 // Nodes that expose dynamic latent_1..latent_12 inputs.
-const DYNAMIC_LATENT_NODES = ["LongVideoStitcher", "SmoothVideoStitcher", "SmoothAudioStitcher", "LTXSmoothTransition"];
+const DYNAMIC_LATENT_NODES = ["LongVideoStitcher", "SmoothVideoStitcher", "SmoothAudioStitcher", "LTXSmoothTransition", "SmoothAudioJoin"];
 function dynamicGroupsFor(comfyClass) {
-    // LTX Smooth Transition has paired per-chunk video + audio groups; the others use latent_.
+    // LTX Smooth Transition has paired per-chunk video + audio latent groups;
+    // Smooth Audio Join takes AUDIO inputs; the others use a single latent_ group.
     if (comfyClass === "LTXSmoothTransition") {
-        return [{ prefix: "video_latent_", min: MIN_VISIBLE }, { prefix: "audio_latent_", min: 1 }];
+        return [{ prefix: "video_latent_", min: MIN_VISIBLE, type: "LATENT" }, { prefix: "audio_latent_", min: 1, type: "LATENT" }];
     }
-    return [{ prefix: "latent_", min: MIN_VISIBLE }];
+    if (comfyClass === "SmoothAudioJoin") {
+        return [{ prefix: "audio_", min: MIN_VISIBLE, type: "AUDIO" }];
+    }
+    return [{ prefix: "latent_", min: MIN_VISIBLE, type: "LATENT" }];
 }
 
 function groupIndex(name, prefix) {
@@ -29,7 +33,7 @@ function groupIndex(name, prefix) {
 
 // Grow/shrink one prefixed input group (e.g. "latent_" or "audio_") to the
 // connected slots + one spare, clamped to [minVisible, MAX_LATENTS].
-function syncGroup(node, prefix, minVisible) {
+function syncGroup(node, prefix, minVisible, type) {
     const inputs = node.inputs || [];
 
     let maxConnected = 0;
@@ -44,7 +48,7 @@ function syncGroup(node, prefix, minVisible) {
 
     while (visible < desired) {
         visible++;
-        node.addInput(`${prefix}${visible}`, "LATENT");
+        node.addInput(`${prefix}${visible}`, type || "LATENT");
     }
 
     // Remove trailing UNCONNECTED slots above `desired` (never touch a linked slot or slot 1).
@@ -99,7 +103,7 @@ function regroupPairedLatents(node) {
 
 function syncLatentInputs(node) {
     try {
-        for (const g of dynamicGroupsFor(node.comfyClass)) syncGroup(node, g.prefix, g.min);
+        for (const g of dynamicGroupsFor(node.comfyClass)) syncGroup(node, g.prefix, g.min, g.type);
         if (node.comfyClass === "LTXSmoothTransition") regroupPairedLatents(node);
         if (node.graph) app.graph.setDirtyCanvas(true, true);
     } catch (e) {

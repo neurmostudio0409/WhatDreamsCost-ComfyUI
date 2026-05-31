@@ -513,6 +513,114 @@ class SmoothAudioStitcher(io.ComfyNode):
         return io.NodeOutput(out)
 
 
+class SmoothAudioJoin(io.ComfyNode):
+    """Join per-chunk AUDIO with a smooth waveform crossfade at each seam.
+
+    Takes already-decoded AUDIO (one per chunk — decode each chunk's audio latent with
+    LTXVAudioVAEDecode first), crossfades the WAVEFORMS at every seam (cosine/linear),
+    and concatenates. Because it works in the waveform domain — not the audio latent —
+    it cannot produce an undecodable latent (the LTX audio VAE is causal and picky about
+    latent length), and an audio crossfade sounds smooth. Output is one AUDIO you can
+    feed straight into CreateVideo.
+
+    This is the safe way to smooth the audio seam when chaining chunks; for video use
+    Smooth Video Stitcher / LTX Smooth Transition.
+    """
+
+    MAX_AUDIO = 12
+
+    @classmethod
+    def define_schema(cls):
+        audio_inputs = [io.Audio.Input("audio_1", tooltip="First chunk's decoded AUDIO (required).")]
+        for i in range(2, cls.MAX_AUDIO + 1):
+            audio_inputs.append(
+                io.Audio.Input(f"audio_{i}", optional=True, tooltip=f"Chunk {i} decoded AUDIO (optional).")
+            )
+        return io.Schema(
+            node_id="SmoothAudioJoin",
+            display_name="Smooth Audio Join",
+            category="WhatDreamsCost",
+            description=(
+                "Crossfades per-chunk AUDIO waveforms at each seam and concatenates them into "
+                "one AUDIO. Decode each chunk's audio latent (e.g. LTXVAudioVAEDecode) first and "
+                "connect the AUDIO outputs to audio_1..N (slots grow). Works in the waveform "
+                "domain so it never breaks the audio VAE. Feed the output into CreateVideo."
+            ),
+            inputs=[
+                *audio_inputs,
+                io.Float.Input(
+                    "crossfade_seconds", default=0.25, min=0.0, max=5.0, step=0.01, optional=True,
+                    tooltip="Length of the crossfade at each seam, in seconds. 0 = hard concatenate (no fade).",
+                ),
+                io.Combo.Input(
+                    "blend_mode", options=["cosine", "linear"], default="cosine", optional=True,
+                    tooltip="Crossfade curve. cosine = smooth eased fade (best). linear = constant-rate fade.",
+                ),
+            ],
+            outputs=[
+                io.Audio.Output(display_name="audio"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, audio_1, audio_2=None, audio_3=None, audio_4=None, audio_5=None, audio_6=None,
+                audio_7=None, audio_8=None, audio_9=None, audio_10=None, audio_11=None, audio_12=None,
+                crossfade_seconds=0.25, blend_mode="cosine") -> io.NodeOutput:
+        ordered = [audio_1, audio_2, audio_3, audio_4, audio_5, audio_6,
+                   audio_7, audio_8, audio_9, audio_10, audio_11, audio_12]
+        auds = [a for a in ordered if a is not None]
+        if not auds:
+            raise ValueError("SmoothAudioJoin: no audio connected.")
+
+        sr = int(auds[0]["sample_rate"])
+        wavs = []
+        for i, a in enumerate(auds):
+            if int(a["sample_rate"]) != sr:
+                raise ValueError(
+                    f"SmoothAudioJoin: clip {i + 1} sample_rate {a['sample_rate']} != clip 1 {sr}."
+                )
+            w = a["waveform"]
+            if w.dim() == 2:       # [C, S] -> [1, C, S]
+                w = w.unsqueeze(0)
+            wavs.append(w)
+
+        ref = wavs[0]
+        for i, w in enumerate(wavs[1:], start=1):
+            if w.shape[0] != ref.shape[0] or w.shape[1] != ref.shape[1]:
+                raise ValueError(
+                    f"SmoothAudioJoin: clip {i + 1} waveform {tuple(w.shape)} batch/channels do "
+                    f"not match clip 1 {tuple(ref.shape)}."
+                )
+
+        n = max(0, int(round(float(crossfade_seconds) * sr)))
+        if len(wavs) == 1:
+            combined = wavs[0]
+        elif n == 0:
+            combined = torch.cat(wavs, dim=2)
+        else:
+            parts = [wavs[0]]
+            for i in range(1, len(wavs)):
+                prev = parts[-1]
+                curr = wavs[i]
+                if prev.shape[2] <= n or curr.shape[2] <= n:
+                    parts.append(curr)  # too short to fade — just butt together
+                    continue
+                prev_main = prev[:, :, :-n]
+                prev_tail = prev[:, :, -n:]
+                curr_head = curr[:, :, :n]
+                curr_main = curr[:, :, n:]
+                blended = _blend_overlap(prev_tail, curr_head, blend_mode)  # broadcasts over [B,C,·]
+                parts[-1] = torch.cat([prev_main, blended], dim=2)
+                parts.append(curr_main)
+            combined = torch.cat(parts, dim=2)
+
+        log.info(
+            "[SmoothAudioJoin] joined %d clip(s) @ %dHz, crossfade=%.2fs (%d samples) -> %s",
+            len(wavs), sr, float(crossfade_seconds), n, tuple(combined.shape),
+        )
+        return io.NodeOutput({"waveform": combined, "sample_rate": sr})
+
+
 class LatentTailToImage(io.ComfyNode):
     """VAE-decode the trailing N frames of a video latent into a pixel image.
 

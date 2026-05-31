@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.25.0**
+  * **New node: `Smooth Audio Join`.** The safe way to smooth the audio seam when chaining chunks. It takes already-decoded **AUDIO** (decode each chunk's audio latent with `LTXVAudioVAEDecode` first), crossfades the WAVEFORMS at each seam (`crossfade_seconds`, cosine/linear) and concatenates → one AUDIO for `CreateVideo`. Because it works on waveforms, not the audio latent, it can never trip the LTX audio VAE's length constraints (unlike inserting/blending audio latent frames). Inputs `audio_1..N` grow dynamically.
+
 **v1.24.2**
   * **`LTX Smooth Transition`: fix audio decode crash + keep the two latent groups un-interleaved.** The audio path no longer inserts crossfade frames into the audio latent — the LTX audio VAE is causal and rejects mid-stream insertions (decode failed with an `un_normalize` size mismatch). The per-chunk audio latents are now simply concatenated (decodes reliably; the audio is shorter than the transition-lengthened video by the total transition length, usually under a second per seam). Also: when the dynamic `video_latent_*` / `audio_latent_*` slots grow they are re-grouped so the two groups never interleave.
 
