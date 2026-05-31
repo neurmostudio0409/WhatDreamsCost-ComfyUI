@@ -14,11 +14,8 @@ const MAX_LATENTS = 12;
 const MIN_VISIBLE = 2; // always show at least latent_1 + one spare
 // Nodes that expose dynamic latent_1..latent_12 inputs.
 const DYNAMIC_LATENT_NODES = ["LongVideoStitcher", "SmoothVideoStitcher", "SmoothAudioStitcher", "LTXSmoothTransition"];
-// LTX Smooth Transition also has a parallel optional audio_1..12 group.
 function dynamicGroupsFor(comfyClass) {
-    const groups = [{ prefix: "latent_", min: MIN_VISIBLE }];
-    if (comfyClass === "LTXSmoothTransition") groups.push({ prefix: "audio_", min: 1 });
-    return groups;
+    return [{ prefix: "latent_", min: MIN_VISIBLE }];
 }
 
 function groupIndex(name, prefix) {
