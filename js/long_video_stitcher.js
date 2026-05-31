@@ -58,9 +58,49 @@ function syncGroup(node, prefix, minVisible) {
     }
 }
 
+// Look up a link object by id across LiteGraph versions (links may be a Map or a plain object).
+function getLink(graph, id) {
+    if (!graph || id == null) return null;
+    const L = graph.links;
+    if (!L) return null;
+    return typeof L.get === "function" ? L.get(id) : L[id];
+}
+
+// addInput() only ever APPENDS, so when one group grows its new slot lands after the
+// other group's slots (and the widgets) — interleaving video_latent_* and audio_latent_*.
+// Re-group them: all video_latent_* together then all audio_latent_*, placed right after
+// the loader sockets (…/audio_vae) and before the widgets, fixing link target slots.
+function regroupPairedLatents(node) {
+    const inputs = node.inputs;
+    if (!inputs) return;
+    const isVid = (n) => /^video_latent_\d+$/.test(n || "");
+    const isAud = (n) => /^audio_latent_\d+$/.test(n || "");
+    const num = (n) => parseInt(/_(\d+)$/.exec(n)[1], 10);
+    const vids = inputs.filter((i) => isVid(i.name)).sort((a, b) => num(a.name) - num(b.name));
+    const auds = inputs.filter((i) => isAud(i.name)).sort((a, b) => num(a.name) - num(b.name));
+    if (!vids.length && !auds.length) return;
+    const others = inputs.filter((i) => !isVid(i.name) && !isAud(i.name));
+    let anchor = others.findIndex((i) => i.name === "audio_vae");
+    if (anchor < 0) anchor = others.findIndex((i) => i.name === "video_vae");
+    const head = anchor >= 0 ? others.slice(0, anchor + 1) : others;
+    const tail = anchor >= 0 ? others.slice(anchor + 1) : [];
+    const reordered = [...head, ...vids, ...auds, ...tail];
+
+    let changed = reordered.length !== inputs.length;
+    if (!changed) for (let i = 0; i < reordered.length; i++) if (reordered[i] !== inputs[i]) { changed = true; break; }
+    if (!changed) return;
+
+    node.inputs = reordered;
+    node.inputs.forEach((inp, i) => {
+        const link = getLink(node.graph, inp.link);
+        if (link) link.target_slot = i;  // keep link routing in sync with the new slot order
+    });
+}
+
 function syncLatentInputs(node) {
     try {
         for (const g of dynamicGroupsFor(node.comfyClass)) syncGroup(node, g.prefix, g.min);
+        if (node.comfyClass === "LTXSmoothTransition") regroupPairedLatents(node);
         if (node.graph) app.graph.setDirtyCanvas(true, true);
     } catch (e) {
         console.error("[LongVideoStitcher] dynamic input sync failed (falling back to static slots):", e);
