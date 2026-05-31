@@ -143,8 +143,8 @@ class LTXSmoothTransition(LTXVAddGuide):
                 io.Vae.Input("audio_vae", optional=True, tooltip="LTX AUDIO VAE. Only needed if you connect audio_latent — used to size each inserted audio bridge to match the video transition's duration. If omitted, the audio:video frame ratio is used instead."),
                 *latent_inputs,
                 io.Int.Input(
-                    "transition_frames", default=25, min=5, max=257, step=1, optional=True,
-                    tooltip="Pixel-frame length of each GENERATED video transition between chunks. Longer = more room for smooth motion.",
+                    "transition_frames", default=33, min=17, max=257, step=1, optional=True,
+                    tooltip="Pixel-frame length of each GENERATED video transition between chunks. LTX latent stride is 8, so this maps to ((N-1)//8)+1 latent frames — the minimum 17 gives 3 latent frames (enough room for the start/end keyframes plus a generated middle). Larger = longer, smoother morph.",
                 ),
                 io.String.Input(
                     "prompt", multiline=True, default="", optional=True,
@@ -205,8 +205,15 @@ class LTXSmoothTransition(LTXVAddGuide):
         scale_factors = video_vae.downscale_index_formula
         time_scale = scale_factors[0]
         _, C, _, h, w = ref.shape  # h, w are LATENT spatial dims
-        tf_px = int(transition_frames)
+        # Need at least 3 latent frames so the two FLF keyframes (frame 0 + last) don't
+        # collide and there's a middle frame to actually generate. Floor tf_px so even an
+        # old saved value that's too small still produces a real transition, not a no-op.
+        min_tf_px = 2 * int(time_scale) + 1  # -> latent_t == 3
+        tf_px = max(min_tf_px, int(transition_frames))
         latent_t = ((tf_px - 1) // time_scale) + 1
+        if tf_px != int(transition_frames):
+            log.info("[LTXSmoothTransition] transition_frames %d too small; raised to %d (%d latent frames).",
+                     int(transition_frames), tf_px, latent_t)
         gp = prompt.strip()
 
         def boundary_image(lat, take_last):

@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.23.3**
+  * **`LTX Smooth Transition`: guard against a too-small `transition_frames`.** With the LTX latent stride of 8, a tiny value (e.g. 6) collapsed to a single latent frame — the two first/last keyframes overlapped and no real transition was generated. The minimum is now 17 (→ 3 latent frames: start + end keyframe + a generated middle), the default is 33, and any smaller value (e.g. from an old saved graph) is floored at runtime with a log note.
+
 **v1.23.2**
   * **`LTX Smooth Transition` fix: FLF keyframe encode used the wrong (pixel) size.** The keyframe encode was passed pixel dimensions instead of the latent width/height, so the encoded keyframe came out at the wrong spatial size — causing a giant VAE encode (the "ran out of memory → tiled" warning) and then a `torch.cat` size-mismatch crash (`Expected size 48 but got size 1536`). It now passes the latent dims, so the encode is correct and light. Also frees VRAM (`soft_empty_cache`) before each seam, and removed the `audio_latent` input (video chunks go through the dynamic `latent_1..N`; stitch audio separately with `Smooth Audio Stitcher`).
 
