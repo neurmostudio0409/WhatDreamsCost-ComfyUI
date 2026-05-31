@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.24.0**
+  * **`LTX Smooth Transition`: paired per-chunk video + audio inputs.** The dynamic video inputs were renamed `latent_1..N` → **`video_latent_1..N`**, and a matching dynamic **`audio_latent_1..N`** group was added (both grow/shrink as you wire them). Connect each chunk's audio to the same-numbered slot and the node inserts an equal-length crossfade bridge into the audio at every seam (sized via `audio_vae`/`frame_rate` if connected, else the per-chunk audio:video ratio), so the audio stays in sync with the lengthened video. Audio inputs are optional (leave them empty for video-only). **Reconnect the video inputs after updating — they were renamed.**
+
 **v1.23.3**
   * **`LTX Smooth Transition`: guard against a too-small `transition_frames`.** With the LTX latent stride of 8, a tiny value (e.g. 6) collapsed to a single latent frame — the two first/last keyframes overlapped and no real transition was generated. The minimum is now 17 (→ 3 latent frames: start + end keyframe + a generated middle), the default is 33, and any smaller value (e.g. from an old saved graph) is floored at runtime with a log note.
 

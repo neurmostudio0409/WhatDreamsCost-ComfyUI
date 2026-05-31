@@ -15,6 +15,10 @@ const MIN_VISIBLE = 2; // always show at least latent_1 + one spare
 // Nodes that expose dynamic latent_1..latent_12 inputs.
 const DYNAMIC_LATENT_NODES = ["LongVideoStitcher", "SmoothVideoStitcher", "SmoothAudioStitcher", "LTXSmoothTransition"];
 function dynamicGroupsFor(comfyClass) {
+    // LTX Smooth Transition has paired per-chunk video + audio groups; the others use latent_.
+    if (comfyClass === "LTXSmoothTransition") {
+        return [{ prefix: "video_latent_", min: MIN_VISIBLE }, { prefix: "audio_latent_", min: 1 }];
+    }
     return [{ prefix: "latent_", min: MIN_VISIBLE }];
 }
 
