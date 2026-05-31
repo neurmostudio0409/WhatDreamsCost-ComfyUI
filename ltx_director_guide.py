@@ -1,5 +1,4 @@
 import logging
-import math
 
 from comfy_extras.nodes_lt import LTXVAddGuide
 import torch
@@ -298,41 +297,21 @@ class LTXSmoothTransition(LTXVAddGuide):
         )
         video_out = {"samples": combined}
 
-        # ---- Audio: insert a matching-length crossfade bridge between each pair of audio
-        # chunks so the audio grows in step with the inserted video transitions. ----
+        # ---- Audio: concatenate the per-chunk audio latents. ----
+        # NOTE: we do NOT insert crossfade frames into the audio. The LTX audio VAE is
+        # causal and picky about the temporal length — inserting frames mid-stream breaks
+        # its patch alignment and the decode fails (un_normalize size mismatch). Plain
+        # concatenation of valid chunk audio decodes fine. The trade-off is that the audio
+        # is shorter than the (transition-lengthened) video by the total transition length
+        # — usually well under a second per seam.
         audio_out = _placeholder_audio()
         if audio_chunks and audio_chunks[0]["samples"].dim() == 4:
             a_samples = [a["samples"] for a in audio_chunks]
-            a_inner = getattr(audio_vae, "first_stage_model", audio_vae) if audio_vae is not None else None
-
-            def _bridge_len(seam_idx):
-                Lv = trans_v_lengths[seam_idx] if seam_idx < len(trans_v_lengths) else 1
-                if a_inner is not None and hasattr(a_inner, "num_of_latents_from_frames"):
-                    try:
-                        return max(1, int(a_inner.num_of_latents_from_frames(max(1, Lv * time_scale), float(frame_rate))))
-                    except Exception:
-                        pass
-                # Fallback: scale by this chunk's audio:video latent-frame ratio.
-                vfr = samples[seam_idx].shape[2]
-                afr = a_samples[seam_idx].shape[2] if seam_idx < len(a_samples) else a_samples[0].shape[2]
-                return max(1, int(round(Lv * afr / vfr))) if vfr > 0 else max(1, Lv)
-
-            def _audio_bridge(a_last, b_first, n):
-                t_lin = torch.linspace(0.0, 1.0, n, dtype=a_last.dtype, device=a_last.device)
-                alpha = (0.5 - 0.5 * torch.cos(math.pi * t_lin)) if audio_blend == "cosine" else t_lin
-                alpha = alpha.view(1, 1, n, 1)
-                return a_last * (1.0 - alpha) + b_first * alpha
-
-            a_pieces = [a_samples[0]]
-            for i in range(len(a_samples) - 1):
-                if i < len(trans_v_lengths):
-                    a_pieces.append(_audio_bridge(a_samples[i][:, :, -1:], a_samples[i + 1][:, :, :1], _bridge_len(i)))
-                a_pieces.append(a_samples[i + 1])
-            a_combined = torch.cat([p for p in a_pieces if p.shape[2] > 0], dim=2)
+            a_combined = torch.cat(a_samples, dim=2)
             audio_out = {"samples": a_combined, "type": audio_chunks[0].get("type", "audio")}
             log.info(
-                "[LTXSmoothTransition] audio: %d chunks + %d bridges -> %s",
-                len(a_samples), max(0, len(a_samples) - 1), tuple(a_combined.shape),
+                "[LTXSmoothTransition] audio: concatenated %d chunks -> %s",
+                len(a_samples), tuple(a_combined.shape),
             )
 
         return io.NodeOutput(video_out, audio_out)

@@ -37,6 +37,9 @@ If you don't see the latest version (v1.3.9) yet in the manager then just downlo
 Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
+**v1.24.2**
+  * **`LTX Smooth Transition`: fix audio decode crash + keep the two latent groups un-interleaved.** The audio path no longer inserts crossfade frames into the audio latent — the LTX audio VAE is causal and rejects mid-stream insertions (decode failed with an `un_normalize` size mismatch). The per-chunk audio latents are now simply concatenated (decodes reliably; the audio is shorter than the transition-lengthened video by the total transition length, usually under a second per seam). Also: when the dynamic `video_latent_*` / `audio_latent_*` slots grow they are re-grouped so the two groups never interleave.
+
 **v1.24.1**
   * **`LTX Smooth Transition`: tidier input order.** Inputs are now grouped logically — loaders (`model`, `clip`, `video_vae`, `audio_vae`) → video chunks (`video_latent_*`) → audio chunks (`audio_latent_*`) → transition controls (`transition_frames`, `prompt`, `strength`) → sampler controls (`steps`, `cfg`, `sampler_name`, `scheduler`, `seed`) → audio-bridge fine-tuning (`frame_rate`, `audio_blend`). The audio-bridge params no longer sit in the middle of the sampler settings.
 
