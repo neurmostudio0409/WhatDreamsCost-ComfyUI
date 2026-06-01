@@ -74,13 +74,17 @@ def segment_latent_lengths(pixel_lengths, latent_frames, stride=WAN_TEMPORAL_STR
     return out
 
 
-def resolve_wan_dims(start_image, width, height, divisible_by=16):
+def resolve_wan_dims(start_image, width, height, divisible_by=16, max_side=0):
     """Resolve target (width, height). 0 = auto-detect from the start image's native
     size, snapped to ``divisible_by`` (LTX-style convenience).
 
+    ``max_side`` (> 0) caps the longest dimension, scaling both down while keeping
+    aspect ratio. This is the main speed lever: a 1072x1600 image runs ~4x slower
+    than Wan's ~480p native, so capping to e.g. 832 (≈480p) or 1280 (≈720p) keeps
+    generation fast and on-distribution.
+
     ``start_image`` is a ComfyUI IMAGE tensor [B, H, W, C] (only ``.shape`` is read,
-    so no torch import is needed). Raises if no image and a dimension is still 0
-    (T2V must specify dims).
+    so no torch import is needed). Raises if no image and a dimension is still 0.
     """
     if start_image is not None:
         nat_h, nat_w = int(start_image.shape[1]), int(start_image.shape[2])
@@ -93,6 +97,10 @@ def resolve_wan_dims(start_image, width, height, divisible_by=16):
             "Wan Director: no start image to auto-detect dimensions from. Set width "
             "and height explicitly (T2V), or provide a start-image segment."
         )
+    if max_side and max_side > 0 and max(w, h) > max_side:
+        scale = max_side / float(max(w, h))
+        w = max(1, int(round(w * scale)))
+        h = max(1, int(round(h * scale)))
     return snap(w, divisible_by), snap(h, divisible_by)
 
 

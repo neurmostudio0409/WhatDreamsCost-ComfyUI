@@ -221,6 +221,10 @@ class WanDirector(io.ComfyNode):
                 io.Combo.Input("display_mode", options=["frames", "seconds"], default="seconds", optional=True),
                 io.Int.Input("divisible_by", default=16, min=1, max=256, step=1, optional=True,
                              tooltip="Snap auto-detected dimensions to a multiple of this (Wan2.1: 16, 2.2-5B: 32)."),
+                io.Int.Input("max_side", default=832, min=0, max=8192, step=16, optional=True,
+                             tooltip="Cap the longest side (keeps aspect ratio). MAIN speed lever — Wan is trained "
+                                     "near 480p. 832 ≈ 480p (fast), 1280 ≈ 720p (slower, sharper), 0 = no cap (uses "
+                                     "the image's native size; can be very slow for large images)."),
                 io.String.Input("guide_strength", default="", optional=True,
                                 tooltip="Unused for Wan; kept for shared timeline-JS compatibility."),
             ],
@@ -237,7 +241,7 @@ class WanDirector(io.ComfyNode):
                 segment_lengths, epsilon=1e-3, steps=8, cfg=1.0, sampler_name="euler",
                 scheduler="simple", seed=0, chunk_frames=81, moe_boundary=4,
                 i2v_backend="native", frame_rate=24, display_mode="seconds", divisible_by=16,
-                guide_strength="", model_low=None, clip_vision=None,
+                max_side=832, guide_strength="", model_low=None, clip_vision=None,
                 clip_vision_start=None, clip_vision_end=None) -> io.NodeOutput:
 
         # --- Validate prompt segments ---
@@ -264,7 +268,7 @@ class WanDirector(io.ComfyNode):
         img_segs = _extract_image_segments(timeline_data, duration_frames)
         timeline_start = _load_image_tensor(img_segs[0]) if len(img_segs) >= 1 else None
         timeline_end = _load_image_tensor(img_segs[-1]) if len(img_segs) >= 2 else None
-        tgt_w, tgt_h = resolve_wan_dims(timeline_start, width, height, divisible_by)
+        tgt_w, tgt_h = resolve_wan_dims(timeline_start, width, height, divisible_by, max_side)
 
         # --- Plan chunks + map each chunk to its timeline prompts ---
         spans = _segment_spans(locals_list, segment_lengths, total_len)
