@@ -3781,10 +3781,14 @@ const APPENDED_WIDGET_DEFAULTS = [
   ["segment_lengths", ""],
 ];
 
+// Nodes that use the shared timeline editor. WanDirector reuses it (it has no
+// audio of its own, so the audio track simply stays empty / inert there).
+const TIMELINE_EDITOR_NODES = ["LTXDirector", "WanDirector"];
+
 app.registerExtension({
   name: "LTXDirector",
   async beforeRegisterNodeDef(nodeType, nodeData, app) {
-    if (nodeData.name === "LTXDirector") {
+    if (TIMELINE_EDITOR_NODES.includes(nodeData.name)) {
 
       const onNodeCreated = nodeType.prototype.onNodeCreated;
       nodeType.prototype.onNodeCreated = function () {
