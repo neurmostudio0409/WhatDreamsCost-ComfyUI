@@ -3508,6 +3508,18 @@ class TimelineEditor {
           if (globalPromptWidget.element) globalPromptWidget.element.style.display = "none";
         }
 
+        // Hide global negative prompt by default on creation (WanDirector only)
+        const globalNegWidget = this.widgets?.find(w => w.name === "global_negative_prompt");
+        if (globalNegWidget) {
+          if (!globalNegWidget.options) globalNegWidget.options = {};
+          globalNegWidget.options.hidden = true;
+          globalNegWidget.hidden = true;
+          globalNegWidget.computeSize = () => [0, 0];
+          setTimeout(() => {
+            if (globalNegWidget.element) globalNegWidget.element.style.display = "none";
+          }, 0);
+        }
+
         // Force refresh via display mode double-toggle trick
         if (this.displayModeWidget) {
           const origVal = this.displayModeWidget.value;
@@ -3519,6 +3531,41 @@ class TimelineEditor {
         }
       });
       menu.appendChild(this._makeSettingRow("Use Global Prompt", cb));
+    }
+
+    // --- Global Negative Prompt Toggle --- (WanDirector only; guarded by widget existence)
+    const globalNegWidget = this.node.widgets?.find(w => w.name === "global_negative_prompt");
+    if (globalNegWidget) {
+      const cbn = document.createElement("input");
+      cbn.type = "checkbox";
+      cbn.checked = !(globalNegWidget.options && globalNegWidget.options.hidden);
+      cbn.style.cursor = "pointer";
+      cbn.addEventListener("change", () => {
+        const isVisible = cbn.checked;
+        if (!globalNegWidget.options) globalNegWidget.options = {};
+        globalNegWidget.options.hidden = !isVisible;
+
+        if (isVisible) {
+          delete globalNegWidget.computeSize;
+          globalNegWidget.hidden = false;
+          if (globalNegWidget.element) globalNegWidget.element.style.display = "";
+        } else {
+          globalNegWidget.computeSize = () => [0, 0];
+          globalNegWidget.hidden = true;
+          if (globalNegWidget.element) globalNegWidget.element.style.display = "none";
+        }
+
+        // Force refresh via display mode double-toggle trick
+        if (this.displayModeWidget) {
+          const origVal = this.displayModeWidget.value;
+          const otherVal = origVal === "frames" ? "seconds" : "frames";
+          this.displayModeWidget.value = otherVal;
+          if (this.displayModeWidget.callback) this.displayModeWidget.callback(otherVal);
+          this.displayModeWidget.value = origVal;
+          if (this.displayModeWidget.callback) this.displayModeWidget.callback(origVal);
+        }
+      });
+      menu.appendChild(this._makeSettingRow("Use Global Negative Prompt", cbn));
     }
 
 

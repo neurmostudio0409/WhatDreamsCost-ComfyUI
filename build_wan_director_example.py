@@ -159,7 +159,6 @@ director = {
         {"name": "clip", "type": "CLIP", "link": None},
         {"name": "vae", "type": "VAE", "shape": 7, "link": None},
         {"name": "clip_vision", "type": "CLIP_VISION", "shape": 7, "link": None},
-        {"name": "negative", "type": "CONDITIONING", "shape": 7, "link": None},
         {"name": "clip_vision_start", "type": "CLIP_VISION_OUTPUT", "shape": 7, "link": None},
         {"name": "clip_vision_end", "type": "CLIP_VISION_OUTPUT", "shape": 7, "link": None},
     ],
@@ -173,12 +172,13 @@ director = {
     ],
     "properties": {"cnr_id": "whatdreamscost-comfyui", "Node name for S&R": "WanDirector"},
     # v2 widget order: REQUIRED (schema order) then OPTIONAL (schema order).
-    #   required: global_prompt, width, height, length, batch_size, duration_frames,
-    #             duration_seconds, timeline_data, local_prompts, segment_lengths, epsilon
+    #   required: global_prompt, global_negative_prompt, width, height, length, batch_size,
+    #             duration_frames, duration_seconds, timeline_data, local_prompts,
+    #             segment_lengths, epsilon
     #   optional: i2v_backend, frame_rate, display_mode, divisible_by, guide_strength
     # width/height = 0 -> auto-detect from start image.
     "widgets_values": [
-        "", 0, 0, 81, 1, 120, 5.0, "", "", "", 0.001,
+        "", "", 0, 0, 81, 1, 120, 5.0, "", "", "", 0.001,
         "native", 24, "seconds", 16, "",
     ],
 }

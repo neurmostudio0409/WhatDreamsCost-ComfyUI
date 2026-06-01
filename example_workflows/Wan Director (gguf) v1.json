@@ -708,12 +708,6 @@
           "link": 11
         },
         {
-          "name": "negative",
-          "type": "CONDITIONING",
-          "shape": 7,
-          "link": null
-        },
-        {
           "name": "clip_vision_start",
           "type": "CLIP_VISION_OUTPUT",
           "shape": 7,
@@ -775,6 +769,7 @@
         "Node name for S&R": "WanDirector"
       },
       "widgets_values": [
+        "",
         "",
         0,
         0,

@@ -58,10 +58,6 @@ def _extract_image_segments(timeline_data, duration_frames):
     return segs
 
 
-def _empty_conditioning(clip):
-    return clip.encode_from_tokens_scheduled(clip.tokenize(""))
-
-
 class WanDirector(io.ComfyNode):
     """Wan timeline editor with Prompt Relay. Place an image at the start of the
     timeline for I2V (and one at the end for first-last-frame); prompt segments
@@ -92,8 +88,6 @@ class WanDirector(io.ComfyNode):
                                             "the semantic anchor that keeps the output faithful to the input image's "
                                             "features/colors. Without it, only the latent concat anchors the image (weak; "
                                             "the result drifts)."),
-                io.Conditioning.Input("negative", optional=True,
-                                      tooltip="Optional negative. If unconnected an empty negative is built from clip."),
                 io.ClipVisionOutput.Input("clip_vision_start", optional=True,
                                           tooltip="Optional pre-encoded CLIP-Vision output of the start image "
                                                   "(overrides the internal encode)."),
@@ -102,6 +96,9 @@ class WanDirector(io.ComfyNode):
                 # --- required timeline widgets (names mirror LTX Director for the shared JS) ---
                 io.String.Input("global_prompt", multiline=True, default="",
                                 tooltip="Conditions the entire video; anchors persistent characters / scene."),
+                io.String.Input("global_negative_prompt", multiline=True, default="",
+                                tooltip="Global negative prompt for the whole video. Toggle 'Use Global Negative "
+                                        "Prompt' in the timeline settings to show/edit it. Empty = empty negative."),
                 io.Int.Input("width", default=0, min=0, max=8192, step=16,
                              tooltip="0 = auto-detect from the start image (snapped to divisible_by). Set for T2V."),
                 io.Int.Input("height", default=0, min=0, max=8192, step=16,
@@ -144,11 +141,11 @@ class WanDirector(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_high, clip, global_prompt, width, height, length, batch_size,
-                duration_frames, duration_seconds, timeline_data, local_prompts, segment_lengths,
+    def execute(cls, model_high, clip, global_prompt, global_negative_prompt, width, height, length,
+                batch_size, duration_frames, duration_seconds, timeline_data, local_prompts, segment_lengths,
                 epsilon=1e-3, i2v_backend="native", frame_rate=24, display_mode="seconds",
                 divisible_by=16, guide_strength="",
-                model_low=None, vae=None, clip_vision=None, negative=None,
+                model_low=None, vae=None, clip_vision=None,
                 clip_vision_start=None, clip_vision_end=None) -> io.NodeOutput:
 
         # --- Validate prompt segments ---
@@ -188,8 +185,8 @@ class WanDirector(io.ComfyNode):
         raw_tokenizer = get_raw_tokenizer(clip)
         full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, locals_list)
         positive = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
-        if negative is None:
-            negative = _empty_conditioning(clip)
+        # Negative comes from the global negative prompt widget (empty -> empty negative).
+        negative = clip.encode_from_tokens_scheduled(clip.tokenize(global_negative_prompt or ""))
 
         # --- Build Wan latent + I2V/FLF/T2V conditioning (delegates to native Wan nodes) ---
         positive, negative, latent, latent_frames = encode_wan_i2v(
