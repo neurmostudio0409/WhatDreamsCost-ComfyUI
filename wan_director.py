@@ -3,14 +3,16 @@ long-video generation (v3).
 
 Wan I2V is a single-pass model (~5s / ~81 frames). To give the LTX-Director
 experience — one timeline → an arbitrarily long video — WanDirector does the
-segmentation ITSELF, on the backend:
+segmentation ITSELF, on the backend, KEYFRAME-driven:
 
-  - The timeline duration sets the total length.
-  - The node splits it into <= chunk_frames pieces.
-  - Each chunk is generated as a Wan I2V (MoE high→low sampling, internal), with
-    its prompt taken from the timeline region it covers (Prompt Relay per chunk).
-  - Chunk N+1's start image = chunk N's last decoded frame (seamless continuation).
-  - All chunk latents are stitched (1-frame seam dropped) into one long latent.
+  - Each timeline segment is a keyframe region: its image anchors that part of
+    the video, its prompt drives that part.
+  - A segment is sub-split into <= chunk_frames pieces. Its first piece starts
+    from the segment's image (the keyframe); later pieces chain from the previous
+    decoded tail; the last piece morphs to the NEXT segment's image via
+    first-last-frame (FLF) — so the video passes through every keyframe in order.
+  - Each piece is generated as a Wan I2V/FLF (MoE high→low sampling, internal).
+  - All piece latents are stitched (1-frame seam dropped) into one long latent.
 
 So it absorbs the two KSamplerAdvanced: the graph is just
     loaders → Wan Director → VAEDecode → VideoCombine.
@@ -48,67 +50,64 @@ def _snap_len(n):
     return max(5, ((n - 1) // WAN_STRIDE) * WAN_STRIDE + 1)
 
 
-def _extract_image_segments(timeline_data, duration_frames):
-    """Image segments from the timeline JSON, sorted by start (first = start frame,
-    last = end frame for FLF)."""
+def _parse_timeline(timeline_data, duration_frames):
+    """All timeline segments (in order) with their prompt, length, and image (if any).
+    Each segment is a KEYFRAME region: its image anchors that part of the video."""
     try:
         tdata = json.loads(timeline_data) if timeline_data else {}
     except (ValueError, TypeError):
         return []
-    segs = [
-        s for s in tdata.get("segments", [])
-        if s.get("type", "image") == "image"
-        and (s.get("imageFile") or s.get("imageB64"))
-        and int(s.get("start", 0)) < duration_frames
-    ]
-    segs.sort(key=lambda s: s.get("start", 0))
-    return segs
+    out = []
+    for s in tdata.get("segments", []):
+        if int(s.get("start", 0)) >= duration_frames:
+            continue
+        out.append({
+            "start": int(s.get("start", 0)),
+            "length": max(1, int(s.get("length", 1))),
+            "prompt": (s.get("prompt") or "").strip(),
+            "raw": s,
+            "has_img": bool(s.get("imageFile") or s.get("imageB64")),
+        })
+    out.sort(key=lambda x: x["start"])
+    return out
 
 
-def _segment_spans(locals_list, segment_lengths_str, total_len):
-    """Reconstruct each prompt segment's [start, end) span in frames, scaled to
-    total_len. Falls back to an even split when lengths are missing/mismatched."""
-    n = len(locals_list)
-    lens = []
-    if segment_lengths_str and segment_lengths_str.strip():
-        lens = [int(float(x.strip())) for x in segment_lengths_str.split(",") if x.strip()]
-    if len(lens) != n or sum(lens) <= 0:
-        base = max(1, total_len // n)
-        lens = [base] * n
-        lens[-1] += total_len - base * n
-    scale = total_len / max(1, sum(lens))
-    spans = []
-    cur = 0.0
-    for p, l in zip(locals_list, lens):
-        start = cur
-        cur += l * scale
-        spans.append((p, start, cur))
-    return spans
+def _plan_pieces(seg_len, chunk_max):
+    """Split one segment's frame length into evenly-sized pieces of <= chunk_max
+    (valid Wan lengths) — avoids tiny remainder pieces that make abrupt FLF morphs."""
+    seg_len = max(1, int(seg_len))
+    chunk_max = max(5, int(chunk_max))
+    if seg_len <= chunk_max:
+        return [_snap_len(seg_len)]
+    n = (seg_len + chunk_max - 1) // chunk_max  # ceil
+    base = max(5, seg_len // n)
+    return [_snap_len(base) for _ in range(n)]
 
 
-def _plan_chunks(total_len, chunk_max):
-    """Split total_len frames into chunks of <= chunk_max (each a valid Wan length).
-    Consecutive chunks share 1 frame (chunk N+1 starts on chunk N's last frame).
-    Returns (chunk_lengths, windows) where windows[i] = (start, end) unique-frame
-    range of chunk i in total_len space."""
-    total_len = _snap_len(total_len)
-    cmax = _snap_len(min(chunk_max, total_len))
-    chunks, windows = [], []
-    produced = 0
-    while produced < total_len and len(chunks) < 256:
-        if not chunks:
-            clen = _snap_len(min(cmax, total_len))
-            new = clen
-        else:
-            want = (total_len - produced) + 1  # +1 shared start frame
-            clen = _snap_len(min(cmax, want))
-            new = clen - 1
-            if new <= 0:
-                break
-        windows.append((produced, produced + new))
-        produced += new
-        chunks.append(clen)
-    return chunks, windows
+def _build_chunk_specs(segs, total_len, chunk_max):
+    """Turn timeline segments into a flat list of chunk specs.
+
+    Each segment's image anchors its first piece (the keyframe). Within a segment
+    longer than chunk_max, later pieces chain from the previous decoded tail. The
+    LAST piece of a segment morphs to the NEXT segment's image via first-last-frame
+    (FLF), so the video passes through every keyframe in order.
+    """
+    sum_len = sum(s["length"] for s in segs) or 1
+    scale = total_len / sum_len
+    specs = []
+    for k, s in enumerate(segs):
+        seg_len = max(_snap_len(1), int(round(s["length"] * scale)))
+        nxt = segs[k + 1] if k + 1 < len(segs) else None
+        next_img_raw = nxt["raw"] if (nxt and nxt["has_img"]) else None
+        pieces = _plan_pieces(seg_len, chunk_max)
+        for pi, plen in enumerate(pieces):
+            specs.append({
+                "prompt": s["prompt"],
+                "length": plen,
+                "start_raw": s["raw"] if (pi == 0 and s["has_img"]) else None,  # None -> chain from tail
+                "end_raw": next_img_raw if pi == len(pieces) - 1 else None,     # FLF morph to next keyframe
+            })
+    return specs
 
 
 def _moe_sample(model_high, model_low, seed, steps, cfg, sampler_name, scheduler,
@@ -244,14 +243,6 @@ class WanDirector(io.ComfyNode):
                 max_side=832, guide_strength="", model_low=None, clip_vision=None,
                 clip_vision_start=None, clip_vision_end=None) -> io.NodeOutput:
 
-        # --- Validate prompt segments ---
-        locals_list = [p.strip() for p in (local_prompts or "").split("|")]
-        for p in locals_list:
-            if not p:
-                raise ValueError("There is a segment on the timeline missing a prompt!")
-        if not locals_list or (len(locals_list) == 1 and not locals_list[0]):
-            raise ValueError("At least one local prompt is required.")
-
         arch, patch_size, _ = detect_model_type(model_high)
         if arch != "wan":
             raise ValueError(
@@ -261,71 +252,63 @@ class WanDirector(io.ComfyNode):
         if vae is None:
             raise ValueError("WanDirector: a Wan VAE is required (encodes images, decodes seams).")
 
-        # --- Total length (0 = follow timeline), then dimensions ---
+        # --- Parse timeline segments (each = a keyframe region: image + prompt + length) ---
+        segs = _parse_timeline(timeline_data, duration_frames)
+        if not segs:
+            raise ValueError("WanDirector: the timeline is empty. Add at least one segment (image + prompt).")
+        for s in segs:
+            if not s["prompt"]:
+                raise ValueError("There is a segment on the timeline missing a prompt!")
+
+        # --- Total length (0 = follow timeline), then dimensions from the first keyframe ---
         total_len = int(length) if length and int(length) > 0 else _snap_len(int(duration_frames))
         total_len = _snap_len(total_len)
+        first_img_seg = next((s for s in segs if s["has_img"]), None)
+        first_image = _load_image_tensor(first_img_seg["raw"]) if first_img_seg else None
+        tgt_w, tgt_h = resolve_wan_dims(first_image, width, height, divisible_by, max_side)
 
-        img_segs = _extract_image_segments(timeline_data, duration_frames)
-        timeline_start = _load_image_tensor(img_segs[0]) if len(img_segs) >= 1 else None
-        timeline_end = _load_image_tensor(img_segs[-1]) if len(img_segs) >= 2 else None
-        tgt_w, tgt_h = resolve_wan_dims(timeline_start, width, height, divisible_by, max_side)
-
-        # --- Plan chunks + map each chunk to its timeline prompts ---
-        spans = _segment_spans(locals_list, segment_lengths, total_len)
-        chunk_lens, windows = _plan_chunks(total_len, chunk_frames)
-        n_chunks = len(chunk_lens)
-        log.info("[WanDirector] total=%d frames, %d chunk(s) %s, %dx%d, backend=%s",
-                 total_len, n_chunks, chunk_lens, tgt_w, tgt_h, i2v_backend)
+        # --- Build chunk specs: each segment's image anchors its region; FLF morph to next keyframe ---
+        specs = _build_chunk_specs(segs, total_len, chunk_frames)
+        n = len(specs)
+        log.info("[WanDirector] %d segment(s) -> %d chunk(s), total~%d frames, %dx%d, backend=%s",
+                 len(segs), n, total_len, tgt_w, tgt_h, i2v_backend)
 
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(global_negative_prompt or ""))
         raw_tokenizer = get_raw_tokenizer(clip)
 
         stitched = None
-        prev_start = None  # decoded tail of the previous chunk
-        for ci, (clen, (ws, we)) in enumerate(zip(chunk_lens, windows)):
-            is_last = ci == n_chunks - 1
-            start_image = timeline_start if ci == 0 else prev_start
-            end_image = timeline_end if (is_last and timeline_end is not None) else None
+        prev_tail = None  # decoded tail of the previous chunk (for chaining within a segment)
+        for si, spec in enumerate(specs):
+            # Start image = this segment's keyframe (first piece) or the previous tail (chained).
+            start_image = _load_image_tensor(spec["start_raw"]) if spec["start_raw"] is not None else prev_tail
+            # End image = next segment's keyframe (FLF morph), only on a segment's last piece.
+            end_image = _load_image_tensor(spec["end_raw"]) if spec["end_raw"] is not None else None
 
-            # Per-chunk CLIP-Vision encode of the start image.
-            cv_start, cv_end = clip_vision_start, clip_vision_end
+            cv_start = cv_end = None
             if clip_vision is not None:
-                if start_image is not None and (ci != 0 or cv_start is None):
+                if start_image is not None:
                     cv_start = clip_vision.encode_image(start_image, crop=True)
-                if end_image is not None and cv_end is None:
+                if end_image is not None:
                     cv_end = clip_vision.encode_image(end_image, crop=True)
+            elif si == 0:
+                cv_start, cv_end = clip_vision_start, clip_vision_end
 
-            # Prompts covering this chunk's timeline window -> per-chunk relay.
-            chunk_locals, chunk_seg_px = [], []
-            for prompt, ss, se in spans:
-                ov = min(se, we) - max(ss, ws)
-                if ov > 0:
-                    chunk_locals.append(prompt)
-                    chunk_seg_px.append(int(round(ov)))
-            if not chunk_locals:  # safety: nearest span by midpoint
-                mid = (ws + we) / 2
-                prompt = min(spans, key=lambda s: abs((s[1] + s[2]) / 2 - mid))[0]
-                chunk_locals, chunk_seg_px = [prompt], [we - ws]
-
-            full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, chunk_locals)
+            # One prompt per chunk (its segment's). Relay reduces to a uniform mask here.
+            full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, [spec["prompt"]])
             positive = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
 
-            # Build the chunk's Wan latent + I2V/FLF/T2V conditioning.
             positive, neg_c, latent, latent_frames = encode_wan_i2v(
-                positive, negative, vae, tgt_w, tgt_h, clen, batch_size,
+                positive, negative, vae, tgt_w, tgt_h, spec["length"], batch_size,
                 start_image=start_image, end_image=end_image,
                 clip_vision_start=cv_start, clip_vision_end=cv_end,
                 backend=i2v_backend,
             )
 
-            # Prompt Relay temporal mask for this chunk.
             samples = latent["samples"]
             tokens_per_frame = (samples.shape[3] // patch_size[1]) * (samples.shape[4] // patch_size[2])
-            parsed = segment_latent_lengths(chunk_seg_px, latent_frames)
-            eff = distribute_segment_lengths(len(chunk_locals), latent_frames, parsed)
+            eff = distribute_segment_lengths(1, latent_frames, None)
             mask_fn = create_mask_fn(build_segments(token_ranges, eff, epsilon, None),
                                      tokens_per_frame, latent_frames)
-
             ph = model_high.clone()
             apply_patches(ph, arch, mask_fn)
             pl = None
@@ -333,18 +316,17 @@ class WanDirector(io.ComfyNode):
                 pl = model_low.clone()
                 apply_patches(pl, arch, mask_fn)
 
-            # Internal MoE sampling for this chunk.
-            sampled = _moe_sample(ph, pl, int(seed) + ci, int(steps), float(cfg),
+            sampled = _moe_sample(ph, pl, int(seed) + si, int(steps), float(cfg),
                                   sampler_name, scheduler, positive, neg_c, latent, moe_boundary)
-            s = sampled["samples"]
+            sout = sampled["samples"]
 
-            # Stitch (drop the 1-frame seam shared with the previous chunk).
-            stitched = s if stitched is None else torch.cat([stitched, s[:, :, 1:]], dim=2)
-            log.info("[WanDirector] chunk %d/%d: %d frames, prompts=%d -> stitched %s",
-                     ci + 1, n_chunks, clen, len(chunk_locals), tuple(stitched.shape))
+            # Stitch (drop the 1-frame seam each chunk shares with the previous frame).
+            stitched = sout if stitched is None else torch.cat([stitched, sout[:, :, 1:]], dim=2)
+            log.info("[WanDirector] chunk %d/%d: %d frames, kf=%s flf=%s -> stitched %s",
+                     si + 1, n, spec["length"], spec["start_raw"] is not None,
+                     end_image is not None, tuple(stitched.shape))
 
-            # Decode this chunk's tail as the next chunk's start image.
-            if not is_last:
-                prev_start = _decode_tail_start(vae, s)
+            if si < n - 1:
+                prev_tail = _decode_tail_start(vae, sout)
 
         return io.NodeOutput({"samples": stitched}, float(frame_rate))
