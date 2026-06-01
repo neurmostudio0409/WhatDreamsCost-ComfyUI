@@ -167,10 +167,16 @@ def make_director(pos):
             {"name": "frame_rate", "type": "FLOAT", "links": []},
         ],
         "properties": {"cnr_id": "whatdreamscost-comfyui", "Node name for S&R": "WanDirector"},
+        # FRONTEND order: required widgets (schema order) then optional widgets
+        # (schema order). width/height = 0 -> auto-detect from the start image.
+        #   required: model_variant, global_prompt, width, height, length,
+        #             batch_size, duration_frames, duration_seconds, timeline_data,
+        #             local_prompts, segment_lengths, epsilon, guide_strength
+        #   optional: use_custom_audio, frame_rate, display_mode, custom_width,
+        #             custom_height, resize_method, divisible_by, img_compression
         "widgets_values": [
-            "auto", "", 832, 480, 81, 1, 120, 5.0, "", False,
-            "", "", 0.001, 24, "seconds", "", 0, 0,
-            "maintain aspect ratio", 16, 0,
+            "auto", "", 0, 0, 81, 1, 120, 5.0, "", "", "", 0.001, "",
+            False, 24, "seconds", 0, 0, "maintain aspect ratio", 16, 0,
         ],
     }
     out_nodes.append(n)

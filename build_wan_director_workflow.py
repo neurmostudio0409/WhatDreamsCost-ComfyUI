@@ -174,16 +174,17 @@ director = {
         "cnr_id": "whatdreamscost-comfyui",
         "Node name for S&R": "WanDirector",
     },
-    # widgets_values follow the schema's widget-input declaration order:
-    # model_variant, global_prompt, width, height, length, batch_size,
-    # duration_frames, duration_seconds, timeline_data, use_custom_audio,
-    # local_prompts, segment_lengths, epsilon, frame_rate, display_mode,
-    # guide_strength, custom_width, custom_height, resize_method,
-    # divisible_by, img_compression
+    # widgets_values follow the FRONTEND order: REQUIRED widgets first (in schema
+    # order), THEN optional widgets (in schema order) — NOT raw schema order.
+    #   required: model_variant, global_prompt, width, height, length, batch_size,
+    #             duration_frames, duration_seconds, timeline_data, local_prompts,
+    #             segment_lengths, epsilon, guide_strength
+    #   optional: use_custom_audio, frame_rate, display_mode, custom_width,
+    #             custom_height, resize_method, divisible_by, img_compression
+    # width/height = 0 -> auto-detect from the start image.
     "widgets_values": [
-        "auto", "", 832, 480, 81, 1, 120, 5.0, "", False,
-        "", "", 0.001, 24, "seconds", "", 0, 0,
-        "maintain aspect ratio", 16, 0,
+        "auto", "", 0, 0, 81, 1, 120, 5.0, "", "", "", 0.001, "",
+        False, 24, "seconds", 0, 0, "maintain aspect ratio", 16, 0,
     ],
 }
 out_nodes.append(director)

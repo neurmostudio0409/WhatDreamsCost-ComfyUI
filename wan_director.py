@@ -295,10 +295,14 @@ class WanDirector(io.ComfyNode):
                                tooltip="'auto' picks from the model's latent format and image-segment count."),
                 io.String.Input("global_prompt", multiline=True, default="",
                                 tooltip="Conditions the entire video. Anchors persistent characters / scene context."),
-                io.Int.Input("width", default=832, min=16, max=8192, step=16,
-                             tooltip="Output width. Wan2.2-5B usually wants a multiple of 32 (e.g. 1280)."),
-                io.Int.Input("height", default=480, min=16, max=8192, step=16,
-                             tooltip="Output height. Wan2.2-5B usually wants a multiple of 32 (e.g. 704)."),
+                io.Int.Input("width", default=0, min=0, max=8192, step=16,
+                             tooltip="Output width. 0 = auto-detect from the start image (I2V/FLF/chained); "
+                                     "snapped to `divisible_by`. Set a value to force a size, or for T2V "
+                                     "(no start image). Wan2.2-5B usually wants a multiple of 32 (e.g. 1280)."),
+                io.Int.Input("height", default=0, min=0, max=8192, step=16,
+                             tooltip="Output height. 0 = auto-detect from the start image (I2V/FLF/chained); "
+                                     "snapped to `divisible_by`. Set a value to force a size, or for T2V "
+                                     "(no start image). Wan2.2-5B usually wants a multiple of 32 (e.g. 704)."),
                 io.Int.Input("length", default=81, min=1, max=10000, step=4,
                              tooltip="Pixel-space frame count. Wan models expect (length - 1) %% 4 == 0 (e.g. 81, 77, 49)."),
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
@@ -401,15 +405,18 @@ class WanDirector(io.ComfyNode):
         variant = _resolve_variant(model_variant, geom, effective_img_count)
 
         # Snap width/height to multiples
-        tgt_w = custom_width if custom_width > 0 else width
-        tgt_h = custom_height if custom_height > 0 else height
-        tgt_w = _snap(tgt_w, divisible_by)
-        tgt_h = _snap(tgt_h, divisible_by)
+        # Requested dims. 0 = auto-detect from the start image (snapped to divisible_by).
+        # custom_width / custom_height still take precedence over width / height when > 0.
+        req_w = custom_width if custom_width > 0 else width
+        req_h = custom_height if custom_height > 0 else height
 
         def _load_seg(seg):
             t = _load_image_tensor(seg)
-            t = _resize_and_normalize(t, tgt_w, tgt_h, divisible_by, resize_method)
-            return t
+            # Auto-size: when a dimension is 0, take it from the image's native size.
+            nat_h, nat_w = t.shape[1], t.shape[2]
+            w = _snap(req_w if req_w > 0 else nat_w, divisible_by)
+            h = _snap(req_h if req_h > 0 else nat_h, divisible_by)
+            return _resize_and_normalize(t, w, h, divisible_by, resize_method)
 
         start_image = _load_seg(img_segs[0]) if len(img_segs) >= 1 else None
         end_image = _load_seg(img_segs[-1]) if len(img_segs) >= 2 else None
@@ -418,10 +425,20 @@ class WanDirector(io.ComfyNode):
         if start_image is None and prev_start is not None:
             start_image = prev_start
 
-        # Use the (possibly snapped from image) resolved dims for latent generation
+        # Resolve the dims used for latent generation.
         if start_image is not None:
+            # Auto: adopt the (resized / decoded) start image's dimensions.
             tgt_h = start_image.shape[1]
             tgt_w = start_image.shape[2]
+        else:
+            # T2V / no image: can't auto-detect, so explicit width & height are required.
+            if req_w <= 0 or req_h <= 0:
+                raise ValueError(
+                    "WanDirector: no start image to auto-detect dimensions from. Set width and "
+                    "height explicitly (T2V), or add a start-image segment to the timeline."
+                )
+            tgt_w = _snap(req_w, divisible_by)
+            tgt_h = _snap(req_h, divisible_by)
 
         # --- Parsed segment lengths (pixel-space → latent frames) ---
         parsed_lengths = None
