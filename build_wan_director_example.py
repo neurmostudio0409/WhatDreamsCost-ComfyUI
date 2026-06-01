@@ -107,8 +107,8 @@ if MODE == "fp8":
     UNET_HIGH = ["wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors", "fp8_e4m3fn_fast"]
     UNET_LOW = ["wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors", "fp8_e4m3fn_fast"]
     SD3_SHIFT = 8.0
-    KS_HIGH = ["enable", 0, "randomize", 6, 1, "lcm", "simple", 0, 3, "enable"]
-    KS_LOW = ["disable", 0, "fixed", 6, 1, "lcm", "simple", 3, 10000, "disable"]
+    KS_HIGH = ["enable", 0, "randomize", 8, 1, "euler", "simple", 0, 4, "enable"]
+    KS_LOW = ["disable", 0, "fixed", 8, 1, "euler", "simple", 4, 10000, "disable"]
 else:  # gguf
     LOADER_TYPE = "UnetLoaderGGUF"
     UNET_HIGH = ["Wan2.2-I2V-A14B-HighNoise-Q8_0.gguf"]
@@ -119,9 +119,12 @@ else:  # gguf
 
 PUSA_HIGH = "wan2.2\\Wan22_PusaV1_lora_HIGH_resized_dynamic_avg_rank_98_bf16.safetensors"
 PUSA_LOW = "wan2.2\\Wan22_PusaV1_lora_LOW_resized_dynamic_avg_rank_98_bf16.safetensors"
-# lightx2v = low-step speed; PusaV1 = I2V fidelity (helps keep the input image).
-LORA_HIGH = [(LIGHTX2V, 5.0), (PUSA_HIGH, 1.5)]
-LORA_LOW = [(LIGHTX2V, 2.0), (PUSA_LOW, 1.3)]
+# lightx2v = low-step speed LoRA. Standard strength ~1.0 — at the FLF reference's
+# 5.0/2.0 the step-distill LoRA dominates and the model ignores fine input-image
+# conditioning (the start image drifts). 1.0 keeps low-step sampling while staying
+# faithful to the image. PusaV1 = I2V fidelity (helps keep the input image).
+LORA_HIGH = [(LIGHTX2V, 1.0), (PUSA_HIGH, 1.5)]
+LORA_LOW = [(LIGHTX2V, 1.0), (PUSA_LOW, 1.3)]
 CLIP_VISION_NAME = "clip_vision_h.safetensors"
 CLIP_W = ["umt5_xxl_fp8_e4m3fn_scaled.safetensors", "wan", "default"]
 VAE_W = ["wan_2.1_vae.safetensors"] if MODE == "gguf" else ["wan 2.1\\wan_2.1_vae_Comfy-Org.safetensors"]
