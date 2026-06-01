@@ -181,7 +181,7 @@ director = {
     #   optional: i2v_backend, frame_rate, display_mode, divisible_by, guide_strength
     # width/height = 0 -> auto-detect from start image.
     "widgets_values": [
-        "", "", 0, 0, 81, 1, 120, 5.0, "", "", "", 0.001,
+        "", "", 0, 0, 0, 1, 120, 5.0, "", "", "", 0.001,
         "native", 24, "seconds", 16, "",
     ],
 }

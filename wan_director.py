@@ -103,8 +103,10 @@ class WanDirector(io.ComfyNode):
                              tooltip="0 = auto-detect from the start image (snapped to divisible_by). Set for T2V."),
                 io.Int.Input("height", default=0, min=0, max=8192, step=16,
                              tooltip="0 = auto-detect from the start image (snapped to divisible_by). Set for T2V."),
-                io.Int.Input("length", default=81, min=1, max=10000, step=4,
-                             tooltip="Pixel-space frame count. Wan expects (length - 1) %% 4 == 0 (e.g. 81, 77, 49)."),
+                io.Int.Input("length", default=0, min=0, max=10000, step=4,
+                             tooltip="Video length in frames. 0 = follow the timeline duration (like LTX Director), "
+                                     "snapped to Wan's (length-1) %% 4 == 0 grid. Set > 0 to force an exact count. "
+                                     "(Wan I2V is a single generation — quality is best up to ~81-121 frames.)"),
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
                 io.Int.Input("duration_frames", default=120, min=1, max=10000, step=1,
                              tooltip="Timeline display length in pixel-space frames (editor scale only)."),
@@ -181,6 +183,17 @@ class WanDirector(io.ComfyNode):
         # --- Target dimensions (0 = auto-detect from start image) ---
         tgt_w, tgt_h = resolve_wan_dims(start_image, width, height, divisible_by)
 
+        # --- Effective frame count ---
+        # 0 = follow the timeline duration (like LTX Director), snapped to Wan's
+        # (n - 1) % 4 == 0 grid; > 0 forces an exact count. This is what makes a
+        # longer timeline produce a longer video (the previous fixed default was the
+        # reason output was always ~81 frames regardless of the timeline).
+        if length and int(length) > 0:
+            eff_length = int(length)
+        else:
+            df = max(1, int(duration_frames))
+            eff_length = ((df - 1) // 4) * 4 + 1
+
         # --- Build full relay prompt conditioning (independent of the latent) ---
         raw_tokenizer = get_raw_tokenizer(clip)
         full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, locals_list)
@@ -190,7 +203,7 @@ class WanDirector(io.ComfyNode):
 
         # --- Build Wan latent + I2V/FLF/T2V conditioning (delegates to native Wan nodes) ---
         positive, negative, latent, latent_frames = encode_wan_i2v(
-            positive, negative, vae, tgt_w, tgt_h, length, batch_size,
+            positive, negative, vae, tgt_w, tgt_h, eff_length, batch_size,
             start_image=start_image, end_image=end_image,
             clip_vision_start=clip_vision_start, clip_vision_end=clip_vision_end,
             backend=i2v_backend,
@@ -210,8 +223,8 @@ class WanDirector(io.ComfyNode):
         mask_fn = create_mask_fn(q_token_idx, tokens_per_frame, latent_frames)
 
         log.info(
-            "[WanDirector] %dx%d, %d latent frames, %d tokens/frame, %d segments %s, backend=%s",
-            tgt_w, tgt_h, latent_frames, tokens_per_frame, len(locals_list), effective_lengths, i2v_backend,
+            "[WanDirector] %dx%d, %d frames (%d latent), %d tokens/frame, %d segments %s, backend=%s",
+            tgt_w, tgt_h, eff_length, latent_frames, tokens_per_frame, len(locals_list), effective_lengths, i2v_backend,
         )
 
         # --- Patch the same relay mask into both MoE models ---
