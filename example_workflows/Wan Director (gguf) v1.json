@@ -1,8 +1,8 @@
 {
   "id": "wan-director-gguf",
   "revision": 0,
-  "last_node_id": 16,
-  "last_link_id": 22,
+  "last_node_id": 14,
+  "last_link_id": 14,
   "nodes": [
     {
       "id": 1,
@@ -588,7 +588,7 @@
           "slot_index": 0,
           "links": [
             10,
-            21
+            13
           ]
         }
       ],
@@ -698,7 +698,6 @@
         {
           "name": "vae",
           "type": "VAE",
-          "shape": 7,
           "link": 10
         },
         {
@@ -722,40 +721,10 @@
       ],
       "outputs": [
         {
-          "name": "model_high",
-          "type": "MODEL",
-          "links": [
-            12
-          ]
-        },
-        {
-          "name": "model_low",
-          "type": "MODEL",
-          "links": [
-            16
-          ]
-        },
-        {
-          "name": "positive",
-          "type": "CONDITIONING",
-          "links": [
-            13,
-            17
-          ]
-        },
-        {
-          "name": "negative",
-          "type": "CONDITIONING",
-          "links": [
-            14,
-            18
-          ]
-        },
-        {
           "name": "latent",
           "type": "LATENT",
           "links": [
-            15
+            12
           ]
         },
         {
@@ -781,6 +750,13 @@
         "",
         "",
         0.001,
+        8,
+        1.0,
+        "euler",
+        "simple",
+        0,
+        81,
+        3,
         "native",
         24,
         "seconds",
@@ -790,345 +766,9 @@
     },
     {
       "id": 13,
-      "type": "KSamplerAdvanced",
-      "pos": [
-        2800,
-        100
-      ],
-      "size": [
-        301.8984375,
-        367.3834228515625
-      ],
-      "flags": {},
-      "order": 0,
-      "mode": 0,
-      "inputs": [
-        {
-          "label": "model",
-          "localized_name": "model",
-          "name": "model",
-          "type": "MODEL",
-          "link": 12
-        },
-        {
-          "label": "positive",
-          "localized_name": "positive",
-          "name": "positive",
-          "type": "CONDITIONING",
-          "link": 13
-        },
-        {
-          "label": "negative",
-          "localized_name": "negative",
-          "name": "negative",
-          "type": "CONDITIONING",
-          "link": 14
-        },
-        {
-          "label": "latent_image",
-          "localized_name": "latent_image",
-          "name": "latent_image",
-          "type": "LATENT",
-          "link": 15
-        },
-        {
-          "label": "add_noise",
-          "localized_name": "add_noise",
-          "name": "add_noise",
-          "type": "COMBO",
-          "widget": {
-            "name": "add_noise"
-          },
-          "link": null
-        },
-        {
-          "label": "noise_seed",
-          "localized_name": "noise_seed",
-          "name": "noise_seed",
-          "type": "INT",
-          "widget": {
-            "name": "noise_seed"
-          },
-          "link": null
-        },
-        {
-          "label": "steps",
-          "localized_name": "steps",
-          "name": "steps",
-          "type": "INT",
-          "widget": {
-            "name": "steps"
-          },
-          "link": null
-        },
-        {
-          "label": "cfg",
-          "localized_name": "cfg",
-          "name": "cfg",
-          "type": "FLOAT",
-          "widget": {
-            "name": "cfg"
-          },
-          "link": null
-        },
-        {
-          "label": "sampler_name",
-          "localized_name": "sampler_name",
-          "name": "sampler_name",
-          "type": "COMBO",
-          "widget": {
-            "name": "sampler_name"
-          },
-          "link": null
-        },
-        {
-          "label": "scheduler",
-          "localized_name": "scheduler",
-          "name": "scheduler",
-          "type": "COMBO",
-          "widget": {
-            "name": "scheduler"
-          },
-          "link": null
-        },
-        {
-          "label": "start_at_step",
-          "localized_name": "start_at_step",
-          "name": "start_at_step",
-          "type": "INT",
-          "widget": {
-            "name": "start_at_step"
-          },
-          "link": null
-        },
-        {
-          "label": "end_at_step",
-          "localized_name": "end_at_step",
-          "name": "end_at_step",
-          "type": "INT",
-          "widget": {
-            "name": "end_at_step"
-          },
-          "link": null
-        },
-        {
-          "label": "return_with_leftover_noise",
-          "localized_name": "return_with_leftover_noise",
-          "name": "return_with_leftover_noise",
-          "type": "COMBO",
-          "widget": {
-            "name": "return_with_leftover_noise"
-          },
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "label": "LATENT",
-          "localized_name": "LATENT",
-          "name": "LATENT",
-          "type": "LATENT",
-          "links": [
-            19
-          ]
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.45",
-        "Node name for S&R": "KSamplerAdvanced",
-        "ue_properties": {
-          "version": "7.8",
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {}
-        }
-      },
-      "widgets_values": [
-        "enable",
-        0,
-        "randomize",
-        8,
-        1,
-        "euler",
-        "simple",
-        0,
-        3,
-        "enable"
-      ]
-    },
-    {
-      "id": 14,
-      "type": "KSamplerAdvanced",
-      "pos": [
-        3160,
-        100
-      ],
-      "size": [
-        301.8984375,
-        367.3834228515625
-      ],
-      "flags": {},
-      "order": 0,
-      "mode": 0,
-      "inputs": [
-        {
-          "label": "model",
-          "localized_name": "model",
-          "name": "model",
-          "type": "MODEL",
-          "link": 16
-        },
-        {
-          "label": "positive",
-          "localized_name": "positive",
-          "name": "positive",
-          "type": "CONDITIONING",
-          "link": 17
-        },
-        {
-          "label": "negative",
-          "localized_name": "negative",
-          "name": "negative",
-          "type": "CONDITIONING",
-          "link": 18
-        },
-        {
-          "label": "latent_image",
-          "localized_name": "latent_image",
-          "name": "latent_image",
-          "type": "LATENT",
-          "link": 19
-        },
-        {
-          "label": "add_noise",
-          "localized_name": "add_noise",
-          "name": "add_noise",
-          "type": "COMBO",
-          "widget": {
-            "name": "add_noise"
-          },
-          "link": null
-        },
-        {
-          "label": "noise_seed",
-          "localized_name": "noise_seed",
-          "name": "noise_seed",
-          "type": "INT",
-          "widget": {
-            "name": "noise_seed"
-          },
-          "link": null
-        },
-        {
-          "label": "steps",
-          "localized_name": "steps",
-          "name": "steps",
-          "type": "INT",
-          "widget": {
-            "name": "steps"
-          },
-          "link": null
-        },
-        {
-          "label": "cfg",
-          "localized_name": "cfg",
-          "name": "cfg",
-          "type": "FLOAT",
-          "widget": {
-            "name": "cfg"
-          },
-          "link": null
-        },
-        {
-          "label": "sampler_name",
-          "localized_name": "sampler_name",
-          "name": "sampler_name",
-          "type": "COMBO",
-          "widget": {
-            "name": "sampler_name"
-          },
-          "link": null
-        },
-        {
-          "label": "scheduler",
-          "localized_name": "scheduler",
-          "name": "scheduler",
-          "type": "COMBO",
-          "widget": {
-            "name": "scheduler"
-          },
-          "link": null
-        },
-        {
-          "label": "start_at_step",
-          "localized_name": "start_at_step",
-          "name": "start_at_step",
-          "type": "INT",
-          "widget": {
-            "name": "start_at_step"
-          },
-          "link": null
-        },
-        {
-          "label": "end_at_step",
-          "localized_name": "end_at_step",
-          "name": "end_at_step",
-          "type": "INT",
-          "widget": {
-            "name": "end_at_step"
-          },
-          "link": null
-        },
-        {
-          "label": "return_with_leftover_noise",
-          "localized_name": "return_with_leftover_noise",
-          "name": "return_with_leftover_noise",
-          "type": "COMBO",
-          "widget": {
-            "name": "return_with_leftover_noise"
-          },
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "label": "LATENT",
-          "localized_name": "LATENT",
-          "name": "LATENT",
-          "type": "LATENT",
-          "links": [
-            20
-          ]
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.45",
-        "Node name for S&R": "KSamplerAdvanced",
-        "ue_properties": {
-          "version": "7.8",
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {}
-        }
-      },
-      "widgets_values": [
-        "disable",
-        0,
-        "fixed",
-        8,
-        1,
-        "euler",
-        "simple",
-        3,
-        999,
-        "disable"
-      ]
-    },
-    {
-      "id": 15,
       "type": "VAEDecode",
       "pos": [
-        3520,
+        2800,
         100
       ],
       "size": [
@@ -1144,14 +784,14 @@
           "localized_name": "samples",
           "name": "samples",
           "type": "LATENT",
-          "link": 20
+          "link": 12
         },
         {
           "label": "vae",
           "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
-          "link": 21
+          "link": 13
         }
       ],
       "outputs": [
@@ -1162,7 +802,7 @@
           "type": "IMAGE",
           "slot_index": 0,
           "links": [
-            22
+            14
           ]
         }
       ],
@@ -1179,10 +819,10 @@
       "widgets_values": []
     },
     {
-      "id": 16,
+      "id": 14,
       "type": "VHS_VideoCombine",
       "pos": [
-        3800,
+        3080,
         100
       ],
       "size": [
@@ -1198,7 +838,7 @@
           "localized_name": "images",
           "name": "images",
           "type": "IMAGE",
-          "link": 22
+          "link": 14
         },
         {
           "label": "audio",
@@ -1463,85 +1103,21 @@
       0,
       13,
       0,
-      "MODEL"
-    ],
-    [
-      13,
-      12,
-      2,
-      13,
-      1,
-      "CONDITIONING"
-    ],
-    [
-      14,
-      12,
-      3,
-      13,
-      2,
-      "CONDITIONING"
-    ],
-    [
-      15,
-      12,
-      4,
-      13,
-      3,
       "LATENT"
     ],
     [
-      16,
-      12,
-      1,
-      14,
-      0,
-      "MODEL"
-    ],
-    [
-      17,
-      12,
-      2,
-      14,
-      1,
-      "CONDITIONING"
-    ],
-    [
-      18,
-      12,
-      3,
-      14,
-      2,
-      "CONDITIONING"
-    ],
-    [
-      19,
       13,
-      0,
-      14,
-      3,
-      "LATENT"
-    ],
-    [
-      20,
-      14,
-      0,
-      15,
-      0,
-      "LATENT"
-    ],
-    [
-      21,
       10,
       0,
-      15,
+      13,
       1,
       "VAE"
     ],
     [
-      22,
-      15,
+      14,
+      13,
       0,
-      16,
+      14,
       0,
       "IMAGE"
     ]

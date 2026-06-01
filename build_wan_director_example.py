@@ -107,15 +107,14 @@ if MODE == "fp8":
     UNET_HIGH = ["wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors", "fp8_e4m3fn_fast"]
     UNET_LOW = ["wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors", "fp8_e4m3fn_fast"]
     SD3_SHIFT = 8.0
-    KS_HIGH = ["enable", 0, "randomize", 8, 1, "euler", "simple", 0, 4, "enable"]
-    KS_LOW = ["disable", 0, "fixed", 8, 1, "euler", "simple", 4, 10000, "disable"]
+    STEPS, CFG, SAMPLER, SCHED, MOE_BOUNDARY = 8, 1.0, "euler", "simple", 4
 else:  # gguf
     LOADER_TYPE = "UnetLoaderGGUF"
     UNET_HIGH = ["Wan2.2-I2V-A14B-HighNoise-Q8_0.gguf"]
     UNET_LOW = ["Wan2.2-I2V-A14B-LowNoise-Q8_0.gguf"]
     SD3_SHIFT = 5.0
-    KS_HIGH = ["enable", 0, "randomize", 8, 1, "euler", "simple", 0, 3, "enable"]
-    KS_LOW = ["disable", 0, "fixed", 8, 1, "euler", "simple", 3, 999, "disable"]
+    STEPS, CFG, SAMPLER, SCHED, MOE_BOUNDARY = 8, 1.0, "euler", "simple", 3
+CHUNK_FRAMES = 81
 
 PUSA_HIGH = "wan2.2\\Wan22_PusaV1_lora_HIGH_resized_dynamic_avg_rank_98_bf16.safetensors"
 PUSA_LOW = "wan2.2\\Wan22_PusaV1_lora_LOW_resized_dynamic_avg_rank_98_bf16.safetensors"
@@ -160,28 +159,27 @@ director = {
         {"name": "model_high", "type": "MODEL", "link": None},
         {"name": "model_low", "type": "MODEL", "shape": 7, "link": None},
         {"name": "clip", "type": "CLIP", "link": None},
-        {"name": "vae", "type": "VAE", "shape": 7, "link": None},
+        {"name": "vae", "type": "VAE", "link": None},
         {"name": "clip_vision", "type": "CLIP_VISION", "shape": 7, "link": None},
         {"name": "clip_vision_start", "type": "CLIP_VISION_OUTPUT", "shape": 7, "link": None},
         {"name": "clip_vision_end", "type": "CLIP_VISION_OUTPUT", "shape": 7, "link": None},
     ],
     "outputs": [
-        {"name": "model_high", "type": "MODEL", "links": []},
-        {"name": "model_low", "type": "MODEL", "links": []},
-        {"name": "positive", "type": "CONDITIONING", "links": []},
-        {"name": "negative", "type": "CONDITIONING", "links": []},
         {"name": "latent", "type": "LATENT", "links": []},
         {"name": "frame_rate", "type": "FLOAT", "links": []},
     ],
     "properties": {"cnr_id": "whatdreamscost-comfyui", "Node name for S&R": "WanDirector"},
-    # v2 widget order: REQUIRED (schema order) then OPTIONAL (schema order).
+    # v3 widget order: REQUIRED (schema order) then OPTIONAL (schema order).
     #   required: global_prompt, global_negative_prompt, width, height, length, batch_size,
     #             duration_frames, duration_seconds, timeline_data, local_prompts,
-    #             segment_lengths, epsilon
+    #             segment_lengths, epsilon, steps, cfg, sampler_name, scheduler, seed,
+    #             chunk_frames, moe_boundary
     #   optional: i2v_backend, frame_rate, display_mode, divisible_by, guide_strength
-    # width/height = 0 -> auto-detect from start image.
+    # width/height/length = 0 -> auto (length follows the timeline). Director samples
+    # internally (MoE high->low) and chains chunks, so no external KSampler.
     "widgets_values": [
         "", "", 0, 0, 0, 1, 120, 5.0, "", "", "", 0.001,
+        STEPS, CFG, SAMPLER, SCHED, 0, CHUNK_FRAMES, MOE_BOUNDARY,
         "native", 24, "seconds", 16, "",
     ],
 }
@@ -193,22 +191,11 @@ connect(clip, "CLIP", director, "clip", "CLIP")
 connect(vae, "VAE", director, "vae", "VAE")
 connect(clip_vision, "CLIP_VISION", director, "clip_vision", "CLIP_VISION")
 
-# ---- MoE sampler pair (cloned from fp8 ref) -------------------------------
-ks_high = clone(fp8, "KSamplerAdvanced", (2800, 100), list(KS_HIGH))
-ks_low = clone(fp8, "KSamplerAdvanced", (3160, 100), list(KS_LOW))
-connect(director, "model_high", ks_high, "model", "MODEL")
-connect(director, "positive", ks_high, "positive", "CONDITIONING")
-connect(director, "negative", ks_high, "negative", "CONDITIONING")
-connect(director, "latent", ks_high, "latent_image", "LATENT")
-connect(director, "model_low", ks_low, "model", "MODEL")
-connect(director, "positive", ks_low, "positive", "CONDITIONING")
-connect(director, "negative", ks_low, "negative", "CONDITIONING")
-connect(ks_high, "LATENT", ks_low, "latent_image", "LATENT")
-
-vdec = clone(fp8, "VAEDecode", (3520, 100))
-connect(ks_low, "LATENT", vdec, "samples", "LATENT")
+# Director samples internally (MoE high->low) + chains chunks -> stitched latent.
+vdec = clone(fp8, "VAEDecode", (2800, 100))
+connect(director, "latent", vdec, "samples", "LATENT")
 connect(vae, "VAE", vdec, "vae", "VAE")
-vcombine = clone(fp8, "VHS_VideoCombine", (3800, 100))
+vcombine = clone(fp8, "VHS_VideoCombine", (3080, 100))
 connect(vdec, "IMAGE", vcombine, "images", "IMAGE")
 
 wf = {
