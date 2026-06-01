@@ -117,8 +117,12 @@ else:  # gguf
     KS_HIGH = ["enable", 0, "randomize", 8, 1, "euler", "simple", 0, 3, "enable"]
     KS_LOW = ["disable", 0, "fixed", 8, 1, "euler", "simple", 3, 999, "disable"]
 
-LORA_HIGH = [(LIGHTX2V, 5.0)]
-LORA_LOW = [(LIGHTX2V, 2.0)]
+PUSA_HIGH = "wan2.2\\Wan22_PusaV1_lora_HIGH_resized_dynamic_avg_rank_98_bf16.safetensors"
+PUSA_LOW = "wan2.2\\Wan22_PusaV1_lora_LOW_resized_dynamic_avg_rank_98_bf16.safetensors"
+# lightx2v = low-step speed; PusaV1 = I2V fidelity (helps keep the input image).
+LORA_HIGH = [(LIGHTX2V, 5.0), (PUSA_HIGH, 1.5)]
+LORA_LOW = [(LIGHTX2V, 2.0), (PUSA_LOW, 1.3)]
+CLIP_VISION_NAME = "clip_vision_h.safetensors"
 CLIP_W = ["umt5_xxl_fp8_e4m3fn_scaled.safetensors", "wan", "default"]
 VAE_W = ["wan_2.1_vae.safetensors"] if MODE == "gguf" else ["wan 2.1\\wan_2.1_vae_Comfy-Org.safetensors"]
 
@@ -143,6 +147,7 @@ sd3_high = build_model_chain(UNET_HIGH, LORA_HIGH, 0)
 sd3_low = build_model_chain(UNET_LOW, LORA_LOW, 560)
 clip = clone(fp8, "CLIPLoader", (0, 1120), CLIP_W)
 vae = clone(fp8, "VAELoader", (0, 1280), VAE_W)
+clip_vision = clone(fp8, "CLIPVisionLoader", (0, 1400), [CLIP_VISION_NAME])
 
 # ---- Wan Director (v2 schema, hand-built) ---------------------------------
 director = {
@@ -153,6 +158,7 @@ director = {
         {"name": "model_low", "type": "MODEL", "shape": 7, "link": None},
         {"name": "clip", "type": "CLIP", "link": None},
         {"name": "vae", "type": "VAE", "shape": 7, "link": None},
+        {"name": "clip_vision", "type": "CLIP_VISION", "shape": 7, "link": None},
         {"name": "negative", "type": "CONDITIONING", "shape": 7, "link": None},
         {"name": "clip_vision_start", "type": "CLIP_VISION_OUTPUT", "shape": 7, "link": None},
         {"name": "clip_vision_end", "type": "CLIP_VISION_OUTPUT", "shape": 7, "link": None},
@@ -182,6 +188,7 @@ connect(sd3_high, "MODEL", director, "model_high", "MODEL")
 connect(sd3_low, "MODEL", director, "model_low", "MODEL")
 connect(clip, "CLIP", director, "clip", "CLIP")
 connect(vae, "VAE", director, "vae", "VAE")
+connect(clip_vision, "CLIP_VISION", director, "clip_vision", "CLIP_VISION")
 
 # ---- MoE sampler pair (cloned from fp8 ref) -------------------------------
 ks_high = clone(fp8, "KSamplerAdvanced", (2800, 100), list(KS_HIGH))

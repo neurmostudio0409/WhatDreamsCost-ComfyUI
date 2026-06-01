@@ -86,12 +86,19 @@ class WanDirector(io.ComfyNode):
                 io.Clip.Input("clip"),
                 io.Vae.Input("vae", optional=True,
                              tooltip="Required for I2V/FLF (encodes the start/end image) and to size the latent."),
+                io.ClipVision.Input("clip_vision", optional=True,
+                                    tooltip="Strongly recommended for I2V/FLF: a CLIP-Vision model (e.g. clip_vision_h). "
+                                            "The Director CLIP-Vision-encodes its own timeline start/end image, which is "
+                                            "the semantic anchor that keeps the output faithful to the input image's "
+                                            "features/colors. Without it, only the latent concat anchors the image (weak; "
+                                            "the result drifts)."),
                 io.Conditioning.Input("negative", optional=True,
                                       tooltip="Optional negative. If unconnected an empty negative is built from clip."),
                 io.ClipVisionOutput.Input("clip_vision_start", optional=True,
-                                          tooltip="Optional CLIP-Vision output of the start image."),
+                                          tooltip="Optional pre-encoded CLIP-Vision output of the start image "
+                                                  "(overrides the internal encode)."),
                 io.ClipVisionOutput.Input("clip_vision_end", optional=True,
-                                          tooltip="Optional CLIP-Vision output of the end image (FLF only)."),
+                                          tooltip="Optional pre-encoded CLIP-Vision output of the end image (FLF only)."),
                 # --- required timeline widgets (names mirror LTX Director for the shared JS) ---
                 io.String.Input("global_prompt", multiline=True, default="",
                                 tooltip="Conditions the entire video; anchors persistent characters / scene."),
@@ -141,7 +148,7 @@ class WanDirector(io.ComfyNode):
                 duration_frames, duration_seconds, timeline_data, local_prompts, segment_lengths,
                 epsilon=1e-3, i2v_backend="native", frame_rate=24, display_mode="seconds",
                 divisible_by=16, guide_strength="",
-                model_low=None, vae=None, negative=None,
+                model_low=None, vae=None, clip_vision=None, negative=None,
                 clip_vision_start=None, clip_vision_end=None) -> io.NodeOutput:
 
         # --- Validate prompt segments ---
@@ -164,6 +171,15 @@ class WanDirector(io.ComfyNode):
         img_segs = _extract_image_segments(timeline_data, duration_frames)
         start_image = _load_image_tensor(img_segs[0]) if len(img_segs) >= 1 else None
         end_image = _load_image_tensor(img_segs[-1]) if len(img_segs) >= 2 else None
+
+        # --- CLIP-Vision encode the timeline images (the Wan I2V semantic anchor) ---
+        # The Director already holds the images, so it encodes them itself when given a
+        # CLIP-Vision model. Explicit clip_vision_* outputs (if wired) take precedence.
+        if clip_vision is not None:
+            if clip_vision_start is None and start_image is not None:
+                clip_vision_start = clip_vision.encode_image(start_image, crop=True)
+            if clip_vision_end is None and end_image is not None:
+                clip_vision_end = clip_vision.encode_image(end_image, crop=True)
 
         # --- Target dimensions (0 = auto-detect from start image) ---
         tgt_w, tgt_h = resolve_wan_dims(start_image, width, height, divisible_by)
