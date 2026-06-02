@@ -189,15 +189,6 @@ def _moe_sample(model_high, model_low, seed, steps, cfg, sampler_name, scheduler
                            force_full_denoise=True)[0]
 
 
-def _decode_tail_start(vae, samples):
-    """Decode the last latent frame -> a single start-image tensor [1, H, W, C]
-    for the next chunk's I2V keyframe."""
-    decoded = vae.decode(samples[:, :, -1:].contiguous())
-    if decoded.dim() == 5:  # [B, T, H, W, C] -> [T, H, W, C]
-        decoded = decoded[0]
-    return decoded[-1:]
-
-
 class WanDirector(io.ComfyNode):
     """Wan timeline editor with Prompt Relay and single-pass multi-keyframe generation.
     Drop an image on each timeline segment; ALL keyframes that fit one pass are injected
@@ -364,33 +355,29 @@ class WanDirector(io.ComfyNode):
 
         hold = max(1, int(keyframe_hold))
         stitched = None
-        prev_tail = None  # decoded tail of the previous window (latent-continuity bridge)
+        prev_latent_tail = None  # last latent frame of the previous window (latent-space bridge)
+        last_cv = clip_vision_start   # CLIP-Vision of the most recent keyframe (carried forward)
         for wi, win in enumerate(windows):
             w_len = win["length"]
 
-            # Keyframes injected into this single pass. Each: (local_frame, image, is_reference).
-            # If no keyframe sits at this window's start, a later window carries the previous
-            # window's decoded tail at frame 0 for continuity (a continuation, not "held").
-            kf = []
-            wkfs = win["keyframes"]
-            if wi > 0 and prev_tail is not None and not any(int(lf) == 0 for (lf, _r) in wkfs):
-                kf.append((0, prev_tail, False))
-            for (lf, raw) in wkfs:
-                kf.append((int(lf), _load_image_tensor(raw), True))
+            # Real image keyframes in this window. Each: (local_frame, image_tensor).
+            # Cross-window continuity is carried in LATENT space (prev_latent_tail), NOT as a
+            # decoded image — that avoids the VAE decode->re-encode colour drift between windows.
+            kf = [(int(lf), _load_image_tensor(raw)) for (lf, raw) in win["keyframes"]]
 
-            # CLIP-Vision per keyframe (encode the single frame; the semantic anchor).
+            # CLIP-Vision per keyframe (semantic anchor); remember the last one so continuation
+            # windows (no keyframe) stay anchored to the reference instead of drifting.
             cv_outputs = []
-            for idx, (fr, img, is_ref) in enumerate(kf):
-                if clip_vision is not None and img is not None:
-                    cv_outputs.append(clip_vision.encode_image(img[:1], crop=True))
-                elif wi == 0 and idx == 0 and clip_vision_start is not None:
-                    cv_outputs.append(clip_vision_start)
-                else:
-                    cv_outputs.append(None)
+            for (fr, img) in kf:
+                cv = clip_vision.encode_image(img[:1], crop=True) if (clip_vision is not None and img is not None) else None
+                if cv is not None:
+                    last_cv = cv
+                cv_outputs.append(cv)
+            if not cv_outputs and last_cv is not None:
+                cv_outputs = [last_cv]   # carry the reference anchor through continuation windows
 
-            # Hold reference keyframes (pins more latent frames -> stricter adherence); a
-            # carried tail stays one frame. encode_wan_keyframes does the in-latent repeat.
-            inject = [(fr, img, hold if is_ref else 1) for (fr, img, is_ref) in kf]
+            # Hold reference keyframes (pins more latent frames -> stricter adherence).
+            inject = [(fr, img, hold) for (fr, img) in kf]
 
             w_prompts = [p for (p, _l) in win["segments"]]
             w_seg_pix = [l for (_p, l) in win["segments"]]
@@ -400,6 +387,7 @@ class WanDirector(io.ComfyNode):
             positive, neg_c, latent, latent_frames = encode_wan_keyframes(
                 positive, negative, vae, tgt_w, tgt_h, w_len, batch_size,
                 inject, clip_vision_outputs=cv_outputs,
+                latent_context=(prev_latent_tail if wi > 0 else None),
             )
 
             # Prompt Relay (opt-in): temporal cross-attention mask so each segment's prompt
@@ -432,6 +420,6 @@ class WanDirector(io.ComfyNode):
                      wi + 1, n, w_len, len(w_prompts), len(inject), hold, relay_on, tuple(stitched.shape))
 
             if wi < n - 1:
-                prev_tail = _decode_tail_start(vae, sout)
+                prev_latent_tail = sout[:, :, -1:]  # carry in latent space (no VAE round-trip)
 
         return io.NodeOutput({"samples": stitched}, float(frame_rate))

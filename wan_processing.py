@@ -142,7 +142,7 @@ def build_wan_latent(vae, width, height, length, batch_size=1, device=None):
 
 
 def encode_wan_keyframes(positive, negative, vae, width, height, length, batch_size,
-                         keyframes, clip_vision_outputs=None):
+                         keyframes, clip_vision_outputs=None, latent_context=None):
     """Native N-keyframe injection — the generalisation of ``WanFirstLastFrameToVideo``
     to an ARBITRARY number of keyframes at arbitrary frame positions.
 
@@ -190,7 +190,18 @@ def encode_wan_keyframes(positive, negative, vae, width, height, length, batch_s
         m1 = min(latent_t * 4, ((f1 - 1) // 4 + 1) * 4)
         mask[:, :, m0:m1] = 0.0
 
+    # Latent-space continuity: carry the previous window's last latent frame(s) directly
+    # (no decode->re-encode round-trip, the main source of inter-window colour drift).
+    if latent_context is not None:
+        kf = int(latent_context.shape[2])
+        mask[:, :, :kf * 4] = 0.0  # mark those latent frames known (continuation context)
+
     concat_latent_image = vae.encode(image[:, :, :, :3])
+    if latent_context is not None:
+        kf = int(latent_context.shape[2])
+        ctx = latent_context.to(device=concat_latent_image.device, dtype=concat_latent_image.dtype)
+        concat_latent_image[:, :, :kf] = ctx[:, :, :kf]
+
     # Pixel-time mask -> latent-time with Wan's 4-frame temporal patchify.
     mask = mask.view(1, mask.shape[2] // 4, 4, mask.shape[3], mask.shape[4]).transpose(1, 2)
 
