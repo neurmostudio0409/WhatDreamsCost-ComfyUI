@@ -177,7 +177,9 @@ def encode_wan_keyframes(positive, negative, vae, width, height, length, batch_s
     image = torch.ones((length, int(height), int(width), 3)) * 0.5
     mask = torch.ones((1, 1, latent_t * 4, h_lat, w_lat))
 
-    for fidx, img, hold in keyframes:
+    for kf_spec in keyframes:
+        fidx, img, hold = kf_spec[0], kf_spec[1], kf_spec[2]
+        strength = float(kf_spec[3]) if len(kf_spec) > 3 else 1.0
         if img is None:
             continue
         up = comfy.utils.common_upscale(img[:1].movedim(-1, 1), int(width), int(height),
@@ -185,10 +187,12 @@ def encode_wan_keyframes(positive, negative, vae, width, height, length, batch_s
         f0 = max(0, min(int(fidx), length - 1))
         f1 = min(length, f0 + max(1, int(hold)))
         image[f0:f1] = up[0]
-        # Mark every latent temporal patch (stride 4) the keyframe touches as known.
+        # Mark every latent temporal patch (stride 4) the keyframe touches as known. The
+        # mask value encodes the per-keyframe guide strength: 0 = fully enforced (strength 1),
+        # up to 1 = ignored (strength 0). Lower strength lets the model deviate from this image.
         m0 = (f0 // 4) * 4
         m1 = min(latent_t * 4, ((f1 - 1) // 4 + 1) * 4)
-        mask[:, :, m0:m1] = 0.0
+        mask[:, :, m0:m1] = max(0.0, min(1.0, 1.0 - strength))
 
     # Latent-space continuity: carry the previous window's last latent frame(s) directly
     # (no decode->re-encode round-trip, the main source of inter-window colour drift).

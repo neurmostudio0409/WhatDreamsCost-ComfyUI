@@ -293,7 +293,10 @@ class WanDirector(io.ComfyNode):
                                      "near 480p. 832 ≈ 480p (fast), 1280 ≈ 720p (slower, sharper), 0 = no cap (uses "
                                      "the image's native size; can be very slow for large images)."),
                 io.String.Input("guide_strength", default="", optional=True,
-                                tooltip="Unused for Wan; kept for shared timeline-JS compatibility."),
+                                tooltip="Auto-filled per-segment guide strengths (the timeline image-strength slider, "
+                                        "0..1). Each keyframe is enforced with mask = 1 - strength: 1.0 = fully locked "
+                                        "to the reference image, lower lets the model deviate from it. Read per-keyframe "
+                                        "from the timeline; this widget is just the serialized copy."),
                 io.Int.Input("keyframe_hold", default=5, min=1, max=81, step=1, optional=True,
                              tooltip="How many frames to PIN each keyframe (reference image) as known. "
                                      "Higher = stricter adherence to the reference image, at the cost of a "
@@ -379,15 +382,19 @@ class WanDirector(io.ComfyNode):
             start_image = _load_image_tensor(cl["start_raw"]) if (ci == 0 and cl["start_raw"] is not None) else None
             end_image = _load_image_tensor(cl["end_raw"]) if cl["end_raw"] is not None else None
 
+            # Per-keyframe guide strength (0..1 from the timeline slider; 1 = fully enforced).
+            start_str = float(cl["start_raw"].get("guideStrength", 1.0)) if cl["start_raw"] else 1.0
+            end_str = float(cl["end_raw"].get("guideStrength", 1.0)) if cl["end_raw"] else 1.0
+
             inject, cv_outputs = [], []
             if start_image is not None:
-                inject.append((0, start_image, hold))
+                inject.append((0, start_image, hold, start_str))
                 cv = clip_vision.encode_image(start_image[:1], crop=True) if clip_vision is not None else clip_vision_start
                 if cv is not None:
                     last_cv = cv
                 cv_outputs.append(cv)
             if end_image is not None:
-                inject.append((max(0, plen - 1), end_image, hold))
+                inject.append((max(0, plen - 1), end_image, hold, end_str))
                 cv = clip_vision.encode_image(end_image[:1], crop=True) if clip_vision is not None else None
                 if cv is not None:
                     last_cv = cv
