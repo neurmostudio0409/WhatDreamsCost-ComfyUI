@@ -1,27 +1,23 @@
-"""WanDirector — Wan2.2/2.1 timeline node with Prompt Relay + single-pass
-multi-keyframe generation (v2.5).
+"""WanDirector — Wan2.2/2.1 timeline node, segment-aligned first-last-frame (FLF) chaining (v4).
 
-The reference FLF / FMLF workflows get smooth transitions by injecting ALL their
-keyframes into ONE latent and sampling ONCE — never by gluing independently-sampled
-clips. WanDirector does the same, generalised to an arbitrary number of keyframes:
+Both reference workflows ("FLframe transition", "WAN 2.2 Smooth v5") build a long video as a
+chain of FLF clips: each clip morphs from a start image to an end image, and the next clip
+starts from the previous clip's LAST frame, so the segments connect (no independent clips).
+WanDirector does exactly that from the timeline:
 
-  - The timeline is grouped into render WINDOWS of <= chunk_frames each. A short
-    timeline (the common case) is a single window = one pass.
-  - Every keyframe in a window is injected into one latent at its frame position
-    (wan_processing.encode_wan_keyframes, the N-keyframe generalisation of
-    WanFirstLastFrameToVideo) and the window is sampled ONCE (MoE high→low),
-    so motion is continuous across the segments inside it.
-  - Within a window, TRUE multi-segment Prompt Relay applies: each segment's prompt
-    drives its own latent sub-window (no collapse to a uniform per-clip mask).
+  - Each keyframe is a hard boundary; segment i = one FLF clip morphing keyframe_i ->
+    keyframe_{i+1} (the last segment, and any span longer than chunk_frames, continue as I2V).
+  - Every clip starts from the PREVIOUS clip's last decoded frame -> seg1's tail == seg2's
+    head. The keyframe images drive the morph TARGETS.
+  - Each clip is sampled MoE high->low (encode_wan_keyframes = native FLF conditioning),
+    decoded, and COLOUR-MATCHED to the previous clip's last frame to curb drift (like the
+    ColorMatch node in the Smooth reference).
   - keyframe_hold pins each reference image across a few frames for stricter adherence.
-  - Only timelines longer than one pass span multiple windows; adjacent windows are
-    bridged (shared boundary keyframe + carried latent tail) and stitched (1-frame
-    seam dropped) into one long latent.
 
-So it absorbs the two KSamplerAdvanced: the graph is just
-    loaders → Wan Director → VAEDecode → VideoCombine.
+Decodes internally and OUTPUTS IMAGES — the graph is just
+    loaders → Wan Director → VHS_VideoCombine   (no VAEDecode).
 
-Reuses prompt_relay.py + patches.py (already Wan-aware) + wan_processing.py.
+Reuses wan_processing.py (encode_wan_keyframes) + ltx_director._load_image_tensor.
 No audio (Wan has none).
 """
 import json
@@ -32,15 +28,9 @@ import comfy.samplers
 
 from comfy_api.latest import io
 
-from .prompt_relay import (
-    get_raw_tokenizer,
-    map_token_indices,
-    build_segments,
-    create_mask_fn,
-    distribute_segment_lengths,
-)
-from .patches import detect_model_type, apply_patches
-from .wan_processing import resolve_wan_dims, encode_wan_keyframes, segment_latent_lengths
+from .prompt_relay import get_raw_tokenizer, map_token_indices
+from .patches import detect_model_type
+from .wan_processing import resolve_wan_dims, encode_wan_keyframes
 from .ltx_director import _load_image_tensor  # generic image loader (reused)
 
 log = logging.getLogger(__name__)
@@ -122,50 +112,90 @@ def _parse_keyframes(timeline_data, duration_frames):
     return out
 
 
-def _plan_windows(prompts, seg_lens, keyframes, total_len, duration_frames, chunk_max):
-    """Cut the timeline into render WINDOWS of <= chunk_max frames, PRESERVING total length
-    (a span longer than one pass is SPLIT across windows, never truncated). The prompt-relay
-    regions and the image keyframes are mapped onto each window independently.
+def _plan_clips(prompts, seg_lens, keyframes, total_len, duration_frames, chunk_max):
+    """Plan segment-aligned FIRST-LAST-FRAME (FLF) clips — the model both reference
+    workflows use. Each keyframe is a hard boundary; the span between consecutive keyframes
+    is ONE clip that morphs FROM the keyframe at its start TO the next keyframe (FLF). So a
+    clip's last frame is the next clip's first keyframe → the segments truly connect
+    (seg1's tail == seg2's head). The span after the final keyframe, and any span longer
+    than chunk_max, continue as I2V (chained from the previous clip's last frame).
 
-    Returns windows: ``{"length", "segments": [(prompt, local_len)], "keyframes": [(local_frame, raw)]}``.
-    A window's frame 0 is a keyframe at local 0 (segment boundary) or — in later windows —
-    the previous window's carried latent tail (decided by the caller).
+    Returns clips: ``{"length", "prompt", "start_raw": raw|None, "end_raw": raw|None}``.
+      - ``start_raw``: keyframe image to START this clip from — honoured only for clip 0;
+        every later clip starts from the PREVIOUS clip's last decoded frame (continuity).
+      - ``end_raw``: next keyframe image to MORPH TO (FLF); set on the last piece of a span.
     """
     chunk_max = max(5, int(chunk_max))
+    dur = max(1, int(duration_frames))
 
-    # Prompt regions scaled to exactly total_len (no rounding drift).
+    # Prompt regions over [0, total_len), scaled exactly (no rounding drift).
     glens = _largest_remainder([max(1, l) for l in seg_lens], total_len) if seg_lens else [total_len]
-    rprompts = list(prompts) if prompts else [""]
-    if len(rprompts) != len(glens):
-        rprompts = (rprompts + [""] * len(glens))[:len(glens)]
+    rprompts = (list(prompts) + [""] * len(glens))[:len(glens)] if prompts else [""] * len(glens)
     regions, c = [], 0
     for p, L in zip(rprompts, glens):
-        if L <= 0:
-            continue
-        regions.append((c, c + L, p))
-        c += L
+        if L > 0:
+            regions.append((c, c + L, p))
+            c += L
     if not regions:
         regions = [(0, total_len, "")]
 
-    # Keyframe positions mapped from timeline (duration_frames) space into total_len space.
-    dur = max(1, int(duration_frames))
-    kf_pos = sorted(
-        (max(0, min(int(round(st * total_len / dur)), total_len - 1)), raw)
-        for (st, raw) in keyframes
-    )
+    def prompt_for(a, b):
+        best, bestp = 0, regions[0][2]
+        for (s, e, p) in regions:
+            ov = min(e, b) - max(s, a)
+            if ov > best:
+                best, bestp = ov, p
+        return bestp
 
-    windows, pos = [], 0
-    while pos < total_len:
-        remaining = total_len - pos
-        wlen = remaining if remaining <= chunk_max else _snap_len(chunk_max)
-        wlen = max(1, min(wlen, remaining))
-        wstart, wend = pos, pos + wlen
-        wsegs = [(p, min(b, wend) - max(a, wstart))
-                 for (a, b, p) in regions if min(b, wend) > max(a, wstart)]
-        wkfs = [(f - wstart, raw) for (f, raw) in kf_pos if wstart <= f < wend]
-        windows.append({"length": wlen, "segments": wsegs or [("", wlen)], "keyframes": wkfs})
-        pos = wend
-    return windows
+    # Keyframe positions in total_len space; a leading non-keyframe span starts image-less.
+    kf = sorted((max(0, min(int(round(st * total_len / dur)), total_len - 1)), raw)
+                for (st, raw) in keyframes)
+    pts = [p for p, _ in kf]
+    imgs = [r for _, r in kf]
+    if not pts or pts[0] != 0:
+        pts = [0] + pts
+        imgs = [None] + imgs
+
+    clips = []
+    for i in range(len(pts)):
+        span_start = pts[i]
+        span_end = pts[i + 1] if i + 1 < len(pts) else total_len
+        span_len = span_end - span_start
+        if span_len <= 0:
+            continue
+        start_img = imgs[i]
+        end_img = imgs[i + 1] if i + 1 < len(pts) else None
+        npieces = max(1, (span_len + chunk_max - 1) // chunk_max)
+        plens = _largest_remainder([1] * npieces, span_len)
+        off = 0
+        for pi, plen in enumerate(plens):
+            a = span_start + off
+            clips.append({
+                "length": int(plen),
+                "prompt": prompt_for(a, a + plen),
+                "start_raw": start_img if pi == 0 else None,
+                "end_raw": end_img if pi == len(plens) - 1 else None,
+            })
+            off += plen
+    return clips
+
+
+def _color_match(images, ref, strength):
+    """Shift ``images`` [T,H,W,C] colour statistics toward ``ref`` (the previous clip's last
+    frame) by ``strength`` (0..1) — per-channel mean/std (Reinhard) match. Curbs the colour
+    drift that accumulates across chained clips, like the ColorMatch node in the reference
+    'Smooth' workflow. Returns clamped [T,H,W,C]."""
+    if ref is None or strength <= 0:
+        return images
+    ref = ref if ref.dim() == 4 else ref.unsqueeze(0)
+    eps = 1e-5
+    im_mean = images.mean(dim=(0, 1, 2), keepdim=True)
+    im_std = images.std(dim=(0, 1, 2), keepdim=True)
+    rf_mean = ref.mean(dim=(0, 1, 2), keepdim=True)
+    rf_std = ref.std(dim=(0, 1, 2), keepdim=True)
+    matched = (images - im_mean) / (im_std + eps) * rf_std + rf_mean
+    s = float(max(0.0, min(1.0, strength)))
+    return (images * (1.0 - s) + matched * s).clamp(0.0, 1.0)
 
 
 def _moe_sample(model_high, model_low, seed, steps, cfg, sampler_name, scheduler,
@@ -190,11 +220,12 @@ def _moe_sample(model_high, model_low, seed, steps, cfg, sampler_name, scheduler
 
 
 class WanDirector(io.ComfyNode):
-    """Wan timeline editor with Prompt Relay and single-pass multi-keyframe generation.
-    Drop an image on each timeline segment; ALL keyframes that fit one pass are injected
-    into a single latent and sampled once (smooth transitions, like FLF/FMLF), with each
-    segment's prompt driving its own time window. Only timelines longer than one pass span
-    multiple bridged windows, stitched into one latent — no manual chaining."""
+    """Wan timeline editor with segment-aligned first-last-frame (FLF) chaining.
+    Drop an image on each timeline segment; each segment becomes an FLF clip that morphs from
+    its keyframe to the next segment's keyframe, and every clip starts from the previous
+    clip's last decoded frame — so the segments connect (seg1's tail = seg2's head) instead of
+    being independent. Clips are colour-matched to curb drift, decoded internally, and output
+    as IMAGES — feed straight to VHS_VideoCombine (no VAEDecode)."""
 
     @classmethod
     def define_schema(cls):
@@ -203,10 +234,11 @@ class WanDirector(io.ComfyNode):
             display_name="Wan Director",
             category="WhatDreamsCost",
             description=(
-                "Wan2.2/2.1 timeline editor with Prompt Relay. The timeline duration sets the "
-                "video length; all keyframes that fit one pass are injected into a single latent "
-                "and sampled once for smooth transitions (longer timelines span bridged windows). "
-                "Samples internally (MoE high→low) and outputs one long latent — feed it to VAEDecode."
+                "Wan2.2/2.1 timeline → long video. Each segment is a first-last-frame (FLF) clip that "
+                "morphs from its keyframe to the NEXT segment's keyframe, and each clip starts from the "
+                "previous clip's last frame, so segments connect seamlessly (seg1's tail = seg2's head). "
+                "Samples internally (MoE high→low), colour-matches clips to curb drift, decodes, and "
+                "outputs IMAGES — feed straight to VHS_VideoCombine (no VAEDecode)."
             ),
             inputs=[
                 io.Model.Input("model_high", tooltip="Wan diffusion model. For MoE 14B this is the high-noise model."),
@@ -291,15 +323,17 @@ class WanDirector(io.ComfyNode):
                                      "9 ≈ 3. On a first-last (FLF) chunk it is capped to half the chunk so "
                                      "there is room to move between the two keyframes."),
                 io.Boolean.Input("use_prompt_relay", default=False, optional=True,
-                                 tooltip="OFF (default): each window is conditioned on its segment prompt(s) "
-                                         "directly — most reliable adherence. ON: apply the temporal Prompt Relay "
-                                         "cross-attention mask so multiple segment prompts drive different times "
-                                         "within one pass (experimental on Wan; only useful when segments have "
-                                         "genuinely different prompts)."),
+                                 tooltip="Reserved (no-op in FLF-clip mode): each clip is conditioned on its own "
+                                         "segment prompt directly."),
+                io.Float.Input("colormatch_strength", default=0.5, min=0.0, max=1.0, step=0.05, optional=True,
+                               tooltip="Colour-match each clip to the previous clip's last frame (0 = off, 1 = full). "
+                                       "Curbs the colour/feature drift that accumulates across chained FLF clips "
+                                       "(like the ColorMatch node in the 'Smooth' reference workflow). ~0.5 is a good start."),
             ],
             outputs=[
-                io.Latent.Output(display_name="latent",
-                                 tooltip="The full (stitched) video latent. Feed straight to VAEDecode."),
+                io.Image.Output(display_name="images",
+                                tooltip="The full decoded video (all FLF clips chained + colour-matched). Feed "
+                                        "straight to VHS_VideoCombine — NO VAEDecode needed (decoding is internal)."),
                 io.Float.Output(display_name="frame_rate"),
             ],
         )
@@ -311,10 +345,10 @@ class WanDirector(io.ComfyNode):
                 scheduler="simple", seed=0, chunk_frames=81, moe_boundary=4,
                 i2v_backend="native", frame_rate=16, display_mode="seconds", divisible_by=16,
                 max_side=832, guide_strength="", keyframe_hold=5, use_prompt_relay=False,
-                model_low=None, clip_vision=None,
+                colormatch_strength=0.5, model_low=None, clip_vision=None,
                 clip_vision_start=None, clip_vision_end=None) -> io.NodeOutput:
 
-        arch, patch_size, _ = detect_model_type(model_high)
+        arch, _patch_size, _stride = detect_model_type(model_high)
         if arch != "wan":
             raise ValueError(
                 f"WanDirector expects a Wan diffusion model on model_high, got arch='{arch}'. "
@@ -343,83 +377,68 @@ class WanDirector(io.ComfyNode):
         first_image = _load_image_tensor(keyframes[0][1]) if keyframes else None
         tgt_w, tgt_h = resolve_wan_dims(first_image, width, height, divisible_by, max_side)
 
-        # --- Plan render windows: each window is ONE multi-keyframe single pass; only a
-        #     timeline longer than one Wan pass spans multiple (bridged) windows. ---
-        windows = _plan_windows(prompts, seg_lens, keyframes, total_len, duration_frames, chunk_frames)
-        n = len(windows)
-        log.info("[WanDirector] %d prompt-seg, %d keyframe(s) -> %d window(s), total~%d frames, %dx%d",
-                 len(prompts), len(keyframes), n, total_len, tgt_w, tgt_h)
+        # --- Plan segment-aligned FLF clips: seg_i morphs keyframe_i -> keyframe_{i+1}, and
+        #     each clip starts from the previous clip's last frame so the segments connect. ---
+        clips = _plan_clips(prompts, seg_lens, keyframes, total_len, duration_frames, chunk_frames)
+        n = len(clips)
+        log.info("[WanDirector] %d keyframe(s), %d prompt-seg -> %d FLF clip(s), total~%d frames, %dx%d",
+                 len(keyframes), len(prompts), n, total_len, tgt_w, tgt_h)
 
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(global_negative_prompt or ""))
         raw_tokenizer = get_raw_tokenizer(clip)
-
         hold = max(1, int(keyframe_hold))
-        stitched = None
-        prev_latent_tail = None  # last latent frame of the previous window (latent-space bridge)
-        last_cv = clip_vision_start   # CLIP-Vision of the most recent keyframe (carried forward)
-        for wi, win in enumerate(windows):
-            w_len = win["length"]
+        cm_strength = float(colormatch_strength)
 
-            # Real image keyframes in this window. Each: (local_frame, image_tensor).
-            # Cross-window continuity is carried in LATENT space (prev_latent_tail), NOT as a
-            # decoded image — that avoids the VAE decode->re-encode colour drift between windows.
-            kf = [(int(lf), _load_image_tensor(raw)) for (lf, raw) in win["keyframes"]]
+        frames_out = None
+        prev_last = None  # previous clip's last DECODED frame [1,H,W,C] (continuity + colour ref)
+        for ci, cl in enumerate(clips):
+            plen = cl["length"]
 
-            # CLIP-Vision per keyframe (semantic anchor); remember the last one so continuation
-            # windows (no keyframe) stay anchored to the reference instead of drifting.
-            cv_outputs = []
-            for (fr, img) in kf:
-                cv = clip_vision.encode_image(img[:1], crop=True) if (clip_vision is not None and img is not None) else None
-                if cv is not None:
-                    last_cv = cv
-                cv_outputs.append(cv)
-            if not cv_outputs and last_cv is not None:
-                cv_outputs = [last_cv]   # carry the reference anchor through continuation windows
+            # Start from this clip's own keyframe (clip 0 only) or the previous clip's last
+            # frame; morph to the next keyframe (FLF) when this clip ends a segment.
+            if ci == 0 and cl["start_raw"] is not None:
+                start_image = _load_image_tensor(cl["start_raw"])
+            else:
+                start_image = prev_last
+            end_image = _load_image_tensor(cl["end_raw"]) if cl["end_raw"] is not None else None
 
-            # Hold reference keyframes (pins more latent frames -> stricter adherence).
-            inject = [(fr, img, hold) for (fr, img) in kf]
+            cv_start = (clip_vision.encode_image(start_image[:1], crop=True)
+                        if (clip_vision is not None and start_image is not None)
+                        else (clip_vision_start if ci == 0 else None))
+            cv_end = (clip_vision.encode_image(end_image[:1], crop=True)
+                      if (clip_vision is not None and end_image is not None) else None)
 
-            w_prompts = [p for (p, _l) in win["segments"]]
-            w_seg_pix = [l for (_p, l) in win["segments"]]
-            full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, w_prompts)
+            # FLF keyframes for this clip: start at frame 0, morph target at the last frame.
+            inject, cv_outputs = [], []
+            if start_image is not None:
+                inject.append((0, start_image, hold))
+                cv_outputs.append(cv_start)
+            if end_image is not None:
+                inject.append((max(0, plen - 1), end_image, hold))
+                cv_outputs.append(cv_end)
+
+            full_prompt, _tr = map_token_indices(raw_tokenizer, global_prompt, [cl["prompt"]])
             positive = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
 
-            positive, neg_c, latent, latent_frames = encode_wan_keyframes(
-                positive, negative, vae, tgt_w, tgt_h, w_len, batch_size,
+            positive, neg_c, latent, _lf = encode_wan_keyframes(
+                positive, negative, vae, tgt_w, tgt_h, plen, batch_size,
                 inject, clip_vision_outputs=cv_outputs,
-                latent_context=(prev_latent_tail if wi > 0 else None),
             )
 
-            # Prompt Relay (opt-in): temporal cross-attention mask so each segment's prompt
-            # drives its own sub-window. OFF by default — the plain conditioning above is the
-            # most reliable for adherence; relay only helps when segments differ meaningfully.
-            relay_on = use_prompt_relay and sum(1 for p in w_prompts if (p or "").strip()) > 1
-            if relay_on:
-                samples = latent["samples"]
-                tokens_per_frame = (samples.shape[3] // patch_size[1]) * (samples.shape[4] // patch_size[2])
-                eff = segment_latent_lengths(w_seg_pix, latent_frames) or \
-                    distribute_segment_lengths(len(w_prompts), latent_frames, None)
-                mask_fn = create_mask_fn(build_segments(token_ranges, eff, epsilon, None),
-                                         tokens_per_frame, latent_frames)
-                ph = model_high.clone()
-                apply_patches(ph, arch, mask_fn)
-                pl = None
-                if model_low is not None:
-                    pl = model_low.clone()
-                    apply_patches(pl, arch, mask_fn)
-            else:
-                ph, pl = model_high, model_low
-
-            sampled = _moe_sample(ph, pl, int(seed) + wi, int(steps), float(cfg),
+            sampled = _moe_sample(model_high, model_low, int(seed) + ci, int(steps), float(cfg),
                                   sampler_name, scheduler, positive, neg_c, latent, moe_boundary)
-            sout = sampled["samples"]
+            decoded = vae.decode(sampled["samples"])
+            if decoded.dim() == 5:           # [B,T,H,W,C] -> [T,H,W,C]
+                decoded = decoded[0]
 
-            # Stitch (drop the 1-frame seam each window shares with the previous tail).
-            stitched = sout if stitched is None else torch.cat([stitched, sout[:, :, 1:]], dim=2)
-            log.info("[WanDirector] window %d/%d: %d frames, %d segment(s), %d keyframe(s), hold=%d relay=%s -> %s",
-                     wi + 1, n, w_len, len(w_prompts), len(inject), hold, relay_on, tuple(stitched.shape))
+            # Colour-match this clip to the previous clip's last frame (drift control).
+            decoded = _color_match(decoded, prev_last, cm_strength)
 
-            if wi < n - 1:
-                prev_latent_tail = sout[:, :, -1:]  # carry in latent space (no VAE round-trip)
+            # Append, dropping the 1-frame overlap shared with the previous clip's tail.
+            piece = decoded if frames_out is None else decoded[1:]
+            frames_out = piece if frames_out is None else torch.cat([frames_out, piece], dim=0)
+            prev_last = frames_out[-1:].clone()
+            log.info("[WanDirector] clip %d/%d: %d frames, flf=%s prompt=%r -> total %d",
+                     ci + 1, n, plen, end_image is not None, (cl["prompt"] or "")[:24], frames_out.shape[0])
 
-        return io.NodeOutput({"samples": stitched}, float(frame_rate))
+        return io.NodeOutput(frames_out, float(frame_rate))

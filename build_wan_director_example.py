@@ -175,15 +175,16 @@ director = {
     #             segment_lengths, epsilon, steps, cfg, sampler_name, scheduler, seed,
     #             chunk_frames, moe_boundary
     #   optional: i2v_backend, frame_rate, display_mode, divisible_by, max_side,
-    #             guide_strength, keyframe_hold
+    #             guide_strength, keyframe_hold, use_prompt_relay, colormatch_strength
     # width/height/length = 0 -> auto (length follows the timeline). max_side caps the
     # longest side (~480p default) for speed. keyframe_hold pins each reference image
-    # across N frames for stricter adherence (5 ≈ 2 latent frames). Director samples
-    # internally (MoE high->low) and chains chunks, so no external KSampler.
+    # across N frames for stricter adherence (5 ≈ 2 latent frames). colormatch_strength
+    # (0.5) curbs colour drift across chained FLF clips. Director samples MoE high->low,
+    # colour-matches, DECODES internally and outputs IMAGES (no external KSampler/VAEDecode).
     "widgets_values": [
         "", "", 0, 0, 0, 1, 120, 5.0, "", "", "", 0.001,
         STEPS, CFG, SAMPLER, SCHED, 0, CHUNK_FRAMES, MOE_BOUNDARY,
-        "native", 16, "seconds", 16, 832, "", 5,
+        "native", 16, "seconds", 16, 832, "", 5, False, 0.5,
     ],
 }
 out_nodes.append(director)
@@ -194,12 +195,9 @@ connect(clip, "CLIP", director, "clip", "CLIP")
 connect(vae, "VAE", director, "vae", "VAE")
 connect(clip_vision, "CLIP_VISION", director, "clip_vision", "CLIP_VISION")
 
-# Director samples internally (MoE high->low) + chains chunks -> stitched latent.
-vdec = clone(fp8, "VAEDecode", (2800, 100))
-connect(director, "latent", vdec, "samples", "LATENT")
-connect(vae, "VAE", vdec, "vae", "VAE")
+# Director decodes internally + colour-matches -> outputs IMAGES straight to VideoCombine.
 vcombine = clone(fp8, "VHS_VideoCombine", (3080, 100))
-connect(vdec, "IMAGE", vcombine, "images", "IMAGE")
+connect(director, "images", vcombine, "images", "IMAGE")
 
 wf = {
     "id": f"wan-director-{MODE}", "revision": 0,
