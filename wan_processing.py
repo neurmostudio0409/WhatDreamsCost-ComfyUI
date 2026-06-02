@@ -242,17 +242,9 @@ def encode_wan_i2v(positive, negative, vae, width, height, length, batch_size=1,
       * ``end_image`` given        -> WanFirstLastFrameToVideo  (FLF)
       * ``start_image`` only       -> WanImageToVideo            (I2V)
       * neither                    -> WanImageToVideo w/ start_image=None (T2V empty latent)
-      * ``backend == "fmlf"``      -> ComfyUI-Wan22FMLF WanAdvancedI2V if installed,
-                                      else log + fall back to native.
-    """
-    if backend == "fmlf":
-        result = _encode_fmlf(positive, negative, vae, width, height, length, batch_size,
-                              start_image, end_image, clip_vision_start, clip_vision_end)
-        if result is not None:
-            pos, neg, latent = result
-            return pos, neg, latent, int(latent["samples"].shape[2])
-        log.warning("[WanDirector] i2v_backend='fmlf' unavailable; falling back to native.")
 
+    (The REMIX first-middle-last backend is a separate entry point: ``encode_wan_fmlf``.)
+    """
     from comfy_extras.nodes_wan import WanImageToVideo, WanFirstLastFrameToVideo
 
     if end_image is not None:
@@ -271,20 +263,43 @@ def encode_wan_i2v(positive, negative, vae, width, height, length, batch_size=1,
     return pos, neg, latent, int(latent["samples"].shape[2])
 
 
-def _encode_fmlf(positive, negative, vae, width, height, length, batch_size,
-                 start_image, end_image, clip_vision_start, clip_vision_end):
-    """Optional Wan22FMLF backend (WanAdvancedI2V). Returns (pos, neg, latent) or
-    None if the custom node pack isn't installed / its API doesn't match.
+def encode_wan_fmlf(positive, negative, vae, width, height, length, batch_size,
+                    start_image, middle_image, end_image,
+                    cv_start=None, cv_middle=None, cv_end=None,
+                    mode="SINGLE_PERSON", middle_frame_ratio=0.5,
+                    high_noise_mid_strength=0.6, low_noise_start_strength=1.0,
+                    low_noise_mid_strength=0.16, low_noise_end_strength=1.0,
+                    structural_repulsion_boost=1.0):
+    """Call the ComfyUI-Wan22FMLF ``WanFirstMiddleLastFrameToVideo`` node (the REMIX
+    first-middle-last engine) by name via NODE_CLASS_MAPPINGS, so the Director can use it
+    as a generation backend without an import path.
 
-    NOTE: the exact WanAdvancedI2V signature is finalised in Phase 6 (long-video
-    SVI). For now this guards the import so selecting 'fmlf' degrades gracefully to
-    native instead of crashing.
+    Returns ``(positive_high, positive_low, negative, latent_dict)`` — the node emits SEPARATE
+    high/low-noise positives for the two MoE sampling stages — or ``None`` if the node pack
+    is not installed (caller falls back to native).
     """
     try:
-        import importlib
-        mod = importlib.import_module("custom_nodes.ComfyUI-Wan22FMLF")  # placeholder path
+        import nodes as _comfy_nodes
+        cls = _comfy_nodes.NODE_CLASS_MAPPINGS.get("WanFirstMiddleLastFrameToVideo")
     except Exception:
+        cls = None
+    if cls is None:
         return None
-    # Phase 6 will wire WanAdvancedI2V here (prev_latent / svi_motion_strength).
-    log.info("[WanDirector] fmlf backend located but not yet wired (Phase 6).")
-    return None
+
+    fn = getattr(cls(), getattr(cls, "FUNCTION", "execute"))
+    out = fn(
+        positive=positive, negative=negative, vae=vae,
+        start_image=start_image, middle_image=middle_image, end_image=end_image,
+        clip_vision_start_image=cv_start, clip_vision_middle_image=cv_middle,
+        clip_vision_end_image=cv_end,
+        width=int(width), height=int(height), length=int(length), batch_size=int(batch_size),
+        mode=mode, middle_frame_ratio=float(middle_frame_ratio),
+        high_noise_mid_strength=float(high_noise_mid_strength),
+        low_noise_start_strength=float(low_noise_start_strength),
+        low_noise_mid_strength=float(low_noise_mid_strength),
+        low_noise_end_strength=float(low_noise_end_strength),
+        structural_repulsion_boost=float(structural_repulsion_boost),
+    )
+    res = out.result if hasattr(out, "result") else out  # io.NodeOutput or raw tuple
+    positive_high, positive_low, neg, latent = res[0], res[1], res[2], res[3]
+    return positive_high, positive_low, neg, latent

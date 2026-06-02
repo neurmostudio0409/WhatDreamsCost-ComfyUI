@@ -29,7 +29,7 @@ from comfy_api.latest import io
 
 from .prompt_relay import get_raw_tokenizer, map_token_indices
 from .patches import detect_model_type
-from .wan_processing import resolve_wan_dims, encode_wan_keyframes
+from .wan_processing import resolve_wan_dims, encode_wan_keyframes, encode_wan_fmlf
 from .ltx_director import _load_image_tensor  # generic image loader (reused)
 
 log = logging.getLogger(__name__)
@@ -200,6 +200,60 @@ def _moe_sample(model_high, model_low, seed, steps, cfg, sampler_name, scheduler
                            force_full_denoise=True)[0]
 
 
+def _moe_sample_split(model_high, model_low, seed, steps, cfg, sampler_name, scheduler,
+                      positive_high, positive_low, negative, latent, boundary):
+    """MoE sampling where the high and low stages use DIFFERENT positives — as emitted by
+    WanFirstMiddleLastFrameToVideo (positive_high / positive_low). Single model if low None."""
+    from nodes import common_ksampler
+    if model_low is None:
+        return common_ksampler(model_high, seed, steps, cfg, sampler_name, scheduler,
+                               positive_high, negative, latent,
+                               disable_noise=False, start_step=0, last_step=steps,
+                               force_full_denoise=True)[0]
+    boundary = max(1, min(int(boundary), int(steps) - 1))
+    hi = common_ksampler(model_high, seed, steps, cfg, sampler_name, scheduler,
+                         positive_high, negative, latent,
+                         disable_noise=False, start_step=0, last_step=boundary,
+                         force_full_denoise=False)[0]
+    return common_ksampler(model_low, seed, steps, cfg, sampler_name, scheduler,
+                           positive_low, negative, hi,
+                           disable_noise=True, start_step=boundary, last_step=steps,
+                           force_full_denoise=True)[0]
+
+
+def _plan_fmlf_clips(keyframes, total_len, duration_frames, chunk_max):
+    """Plan REMIX first-middle-last clips. Keyframes are grouped into consecutive TRIPLES
+    (start, middle, end) that share their endpoints — k0,k1,k2 then k2,k3,k4 … — so each
+    clip is one WanFirstMiddleLastFrameToVideo pass through 首-中-尾 and consecutive clips
+    connect at the shared keyframe. A trailing pair becomes a first-last clip (no middle).
+
+    Returns clips: ``{"length", "start_raw", "middle_raw"|None, "end_raw", "middle_ratio"}``.
+    Clip length follows the timeline span between its start and end keyframes.
+    """
+    dur = max(1, int(duration_frames))
+    kf = sorted((max(0, min(int(round(st * total_len / dur)), total_len - 1)), raw)
+                for (st, raw) in keyframes)
+    n = len(kf)
+    if n < 2:
+        return []
+    clips, i = [], 0
+    while i < n - 1:
+        s_pos, s_raw = kf[i]
+        if i + 2 < n:
+            (m_pos, m_raw), (e_pos, e_raw), nxt = kf[i + 1], kf[i + 2], i + 2
+        else:
+            (m_pos, m_raw), (e_pos, e_raw), nxt = (None, None), kf[i + 1], i + 1
+        span = max(5, e_pos - s_pos)
+        ratio = ((m_pos - s_pos) / span) if m_pos is not None else 0.5
+        clips.append({
+            "length": _snap_len(min(span, chunk_max)),
+            "start_raw": s_raw, "middle_raw": m_raw, "end_raw": e_raw,
+            "middle_ratio": max(0.05, min(0.95, ratio)),
+        })
+        i = nxt
+    return clips
+
+
 class WanDirector(io.ComfyNode):
     """Wan timeline editor with segment-aligned first-last-frame (FLF) chaining.
     Drop an image on each timeline segment; each segment becomes an FLF clip that morphs from
@@ -277,9 +331,11 @@ class WanDirector(io.ComfyNode):
                                      "(ignored if model_low is unconnected)."),
                 # --- optional widgets ---
                 io.Combo.Input("i2v_backend", options=["native", "fmlf"], default="native", optional=True,
-                               tooltip="Reserved. The generator now uses native N-keyframe injection "
-                                       "(encode_wan_keyframes) for single-pass multi-keyframe transitions; this "
-                                       "selector is kept for widget-order compatibility and a future fmlf backend."),
+                               tooltip="native = built-in FLF chaining (encode_wan_keyframes). fmlf = REMIX "
+                                       "WanFirstMiddleLastFrameToVideo (ComfyUI-Wan22FMLF): groups timeline "
+                                       "keyframes into 首-中-尾 triples, one FMLF pass per clip, MoE high/low from "
+                                       "positive_high/positive_low. Requires the wan22fmlf node pack + REMIX models "
+                                       "on model_high/model_low; falls back to native if the node is missing."),
                 io.Float.Input("frame_rate", default=16, min=1, max=240, step=1, optional=True,
                                tooltip="Playback fps. Each chained piece spans chunk_frames÷frame_rate seconds, so at "
                                        "the default 81÷16≈5s per piece (24 fps would be ~3.4s). The timeline editor "
@@ -319,6 +375,19 @@ class WanDirector(io.ComfyNode):
                                          "frames, so keep segments short (≈≤150 frames) and/or lower max_side. The "
                                          "last segment has no next keyframe, so it stays I2V (add a final keyframe to "
                                          "anchor its end)."),
+                # --- REMIX first-middle-last (i2v_backend = "fmlf") strength controls ---
+                io.String.Input("fmlf_mode", default="SINGLE_PERSON", optional=True,
+                                tooltip="REMIX FMLF 'mode' (e.g. SINGLE_PERSON). Only used when i2v_backend=fmlf."),
+                io.Float.Input("fmlf_high_mid_strength", default=0.6, min=0.0, max=2.0, step=0.01, optional=True,
+                               tooltip="REMIX high_noise_mid_strength (middle-keyframe pull in the high-noise stage)."),
+                io.Float.Input("fmlf_low_start_strength", default=1.0, min=0.0, max=2.0, step=0.01, optional=True,
+                               tooltip="REMIX low_noise_start_strength."),
+                io.Float.Input("fmlf_low_mid_strength", default=0.16, min=0.0, max=2.0, step=0.01, optional=True,
+                               tooltip="REMIX low_noise_mid_strength."),
+                io.Float.Input("fmlf_low_end_strength", default=1.0, min=0.0, max=2.0, step=0.01, optional=True,
+                               tooltip="REMIX low_noise_end_strength."),
+                io.Float.Input("fmlf_structural_repulsion_boost", default=1.0, min=0.0, max=4.0, step=0.01, optional=True,
+                               tooltip="REMIX structural_repulsion_boost (pushes the keyframes apart structurally)."),
             ],
             outputs=[
                 io.Latent.Output(display_name="latent",
@@ -335,7 +404,10 @@ class WanDirector(io.ComfyNode):
                 scheduler="simple", seed=0, chunk_frames=81, moe_boundary=4,
                 i2v_backend="native", frame_rate=16, display_mode="seconds", divisible_by=16,
                 max_side=832, guide_strength="", keyframe_hold=5, use_prompt_relay=False,
-                colormatch_strength=0.0, segment_single_pass=False, model_low=None, clip_vision=None,
+                colormatch_strength=0.0, segment_single_pass=False,
+                fmlf_mode="SINGLE_PERSON", fmlf_high_mid_strength=0.6, fmlf_low_start_strength=1.0,
+                fmlf_low_mid_strength=0.16, fmlf_low_end_strength=1.0, fmlf_structural_repulsion_boost=1.0,
+                model_low=None, clip_vision=None,
                 clip_vision_start=None, clip_vision_end=None) -> io.NodeOutput:
 
         arch, _patch_size, _stride = detect_model_type(model_high)
@@ -367,6 +439,49 @@ class WanDirector(io.ComfyNode):
         first_image = _load_image_tensor(keyframes[0][1]) if keyframes else None
         tgt_w, tgt_h = resolve_wan_dims(first_image, width, height, divisible_by, max_side)
 
+        negative = clip.encode_from_tokens_scheduled(clip.tokenize(global_negative_prompt or ""))
+        raw_tokenizer = get_raw_tokenizer(clip)
+        hold = max(1, int(keyframe_hold))
+
+        # --- REMIX backend: WanFirstMiddleLastFrameToVideo (首-中-尾) per clip ---
+        if i2v_backend == "fmlf":
+            base_positive = clip.encode_from_tokens_scheduled(clip.tokenize(global_prompt or ""))
+            fclips = _plan_fmlf_clips(keyframes, total_len, duration_frames, chunk_frames)
+            if not fclips:
+                raise ValueError("WanDirector(fmlf): need at least 2 image keyframes for first-middle-last.")
+            log.info("[WanDirector/fmlf] %d keyframe(s) -> %d FMLF clip(s), %dx%d",
+                     len(keyframes), len(fclips), tgt_w, tgt_h)
+            stitched = None
+            for ci, fc in enumerate(fclips):
+                s_img = _load_image_tensor(fc["start_raw"])
+                m_img = _load_image_tensor(fc["middle_raw"]) if fc["middle_raw"] is not None else None
+                e_img = _load_image_tensor(fc["end_raw"])
+                cvs = clip_vision.encode_image(s_img[:1], crop=True) if clip_vision is not None else None
+                cvm = clip_vision.encode_image(m_img[:1], crop=True) if (clip_vision is not None and m_img is not None) else None
+                cve = clip_vision.encode_image(e_img[:1], crop=True) if clip_vision is not None else None
+                res = encode_wan_fmlf(
+                    base_positive, negative, vae, tgt_w, tgt_h, fc["length"], batch_size,
+                    s_img, m_img, e_img, cvs, cvm, cve,
+                    mode=fmlf_mode, middle_frame_ratio=fc["middle_ratio"],
+                    high_noise_mid_strength=fmlf_high_mid_strength,
+                    low_noise_start_strength=fmlf_low_start_strength,
+                    low_noise_mid_strength=fmlf_low_mid_strength,
+                    low_noise_end_strength=fmlf_low_end_strength,
+                    structural_repulsion_boost=fmlf_structural_repulsion_boost,
+                )
+                if res is None:
+                    raise ValueError("WanDirector: i2v_backend='fmlf' but the ComfyUI-Wan22FMLF node "
+                                     "(WanFirstMiddleLastFrameToVideo) is not installed. Install it, or set "
+                                     "i2v_backend='native'.")
+                pos_high, pos_low, neg_c, latent = res
+                sampled = _moe_sample_split(model_high, model_low, int(seed) + ci, int(steps), float(cfg),
+                                            sampler_name, scheduler, pos_high, pos_low, neg_c, latent, moe_boundary)
+                sout = sampled["samples"]
+                stitched = sout if stitched is None else torch.cat([stitched, sout[:, :, 1:]], dim=2)
+                log.info("[WanDirector/fmlf] clip %d/%d: %d frames, mid=%s -> stitched %s",
+                         ci + 1, len(fclips), fc["length"], fc["middle_raw"] is not None, tuple(stitched.shape))
+            return io.NodeOutput({"samples": stitched}, float(frame_rate))
+
         # --- Plan segment-aligned FLF clips: seg_i morphs keyframe_i -> keyframe_{i+1}, and
         #     each clip starts from the previous clip's last frame so the segments connect. ---
         # segment_single_pass: one FLF pass per segment (no chunk_frames splitting) so both
@@ -376,10 +491,6 @@ class WanDirector(io.ComfyNode):
         n = len(clips)
         log.info("[WanDirector] %d keyframe(s), %d prompt-seg -> %d FLF clip(s) (single_pass=%s), total~%d frames, %dx%d",
                  len(keyframes), len(prompts), n, segment_single_pass, total_len, tgt_w, tgt_h)
-
-        negative = clip.encode_from_tokens_scheduled(clip.tokenize(global_negative_prompt or ""))
-        raw_tokenizer = get_raw_tokenizer(clip)
-        hold = max(1, int(keyframe_hold))
 
         stitched = None
         prev_latent_tail = None   # previous clip's last LATENT frame (continuity, no VAE round-trip)
