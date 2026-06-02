@@ -183,7 +183,7 @@ director = {
     "widgets_values": [
         "", "", 0, 0, 0, 1, 120, 5.0, "", "", "", 0.001,
         STEPS, CFG, SAMPLER, SCHED, 0, CHUNK_FRAMES, MOE_BOUNDARY,
-        "native", 16, "seconds", 16, 832, "", 5, False, 0.0,
+        "native", 16, "seconds", 16, 832, "", 5, False, 0.0, False,
     ],
 }
 out_nodes.append(director)

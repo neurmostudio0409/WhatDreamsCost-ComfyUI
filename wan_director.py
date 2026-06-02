@@ -311,6 +311,14 @@ class WanDirector(io.ComfyNode):
                                tooltip="Reserved (no-op). Clips now chain in LATENT space (no per-clip decode), so "
                                        "there is no decode→re-encode colour drift to correct. Kept for widget-order "
                                        "compatibility."),
+                io.Boolean.Input("segment_single_pass", default=False, optional=True,
+                                 tooltip="Generate each timeline segment as ONE first-last-frame pass instead of "
+                                         "splitting it into chunk_frames pieces. Both ends are anchored (start ≈ this "
+                                         "keyframe, end = next keyframe), so mid-segment feature/colour DRIFT is far "
+                                         "lower. Cost: a single long pass is much heavier and Wan degrades past ~150 "
+                                         "frames, so keep segments short (≈≤150 frames) and/or lower max_side. The "
+                                         "last segment has no next keyframe, so it stays I2V (add a final keyframe to "
+                                         "anchor its end)."),
             ],
             outputs=[
                 io.Latent.Output(display_name="latent",
@@ -327,7 +335,7 @@ class WanDirector(io.ComfyNode):
                 scheduler="simple", seed=0, chunk_frames=81, moe_boundary=4,
                 i2v_backend="native", frame_rate=16, display_mode="seconds", divisible_by=16,
                 max_side=832, guide_strength="", keyframe_hold=5, use_prompt_relay=False,
-                colormatch_strength=0.5, model_low=None, clip_vision=None,
+                colormatch_strength=0.0, segment_single_pass=False, model_low=None, clip_vision=None,
                 clip_vision_start=None, clip_vision_end=None) -> io.NodeOutput:
 
         arch, _patch_size, _stride = detect_model_type(model_high)
@@ -361,10 +369,13 @@ class WanDirector(io.ComfyNode):
 
         # --- Plan segment-aligned FLF clips: seg_i morphs keyframe_i -> keyframe_{i+1}, and
         #     each clip starts from the previous clip's last frame so the segments connect. ---
-        clips = _plan_clips(prompts, seg_lens, keyframes, total_len, duration_frames, chunk_frames)
+        # segment_single_pass: one FLF pass per segment (no chunk_frames splitting) so both
+        # ends stay anchored — far less mid-segment drift, at the cost of long heavy passes.
+        eff_chunk = 100000 if segment_single_pass else chunk_frames
+        clips = _plan_clips(prompts, seg_lens, keyframes, total_len, duration_frames, eff_chunk)
         n = len(clips)
-        log.info("[WanDirector] %d keyframe(s), %d prompt-seg -> %d FLF clip(s), total~%d frames, %dx%d",
-                 len(keyframes), len(prompts), n, total_len, tgt_w, tgt_h)
+        log.info("[WanDirector] %d keyframe(s), %d prompt-seg -> %d FLF clip(s) (single_pass=%s), total~%d frames, %dx%d",
+                 len(keyframes), len(prompts), n, segment_single_pass, total_len, tgt_w, tgt_h)
 
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(global_negative_prompt or ""))
         raw_tokenizer = get_raw_tokenizer(clip)
