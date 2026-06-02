@@ -200,6 +200,13 @@ connect(director, "latent", vdec, "samples", "LATENT")
 connect(vae, "VAE", vdec, "vae", "VAE")
 vcombine = clone(fp8, "VHS_VideoCombine", (3080, 100))
 connect(vdec, "IMAGE", vcombine, "images", "IMAGE")
+# CRITICAL: play back at the Director's frame_rate (default 16), else the clip looks
+# short/fast (e.g. 469 frames at 24 fps = 19s instead of 30s at 16 fps). Set the widget
+# AND wire the frame_rate link when the VideoCombine exposes it as an input.
+if isinstance(vcombine.get("widgets_values"), dict):
+    vcombine["widgets_values"]["frame_rate"] = 16
+if in_slot(vcombine, "frame_rate") is not None:
+    connect(director, "frame_rate", vcombine, "frame_rate", "FLOAT")
 
 wf = {
     "id": f"wan-director-{MODE}", "revision": 0,
