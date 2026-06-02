@@ -299,6 +299,12 @@ class WanDirector(io.ComfyNode):
                                      "latent frames: 1 = single frame (loosest), 5 ≈ pin 2 latent frames, "
                                      "9 ≈ 3. On a first-last (FLF) chunk it is capped to half the chunk so "
                                      "there is room to move between the two keyframes."),
+                io.Boolean.Input("use_prompt_relay", default=False, optional=True,
+                                 tooltip="OFF (default): each window is conditioned on its segment prompt(s) "
+                                         "directly — most reliable adherence. ON: apply the temporal Prompt Relay "
+                                         "cross-attention mask so multiple segment prompts drive different times "
+                                         "within one pass (experimental on Wan; only useful when segments have "
+                                         "genuinely different prompts)."),
             ],
             outputs=[
                 io.Latent.Output(display_name="latent",
@@ -313,7 +319,8 @@ class WanDirector(io.ComfyNode):
                 segment_lengths, epsilon=1e-3, steps=8, cfg=1.0, sampler_name="euler",
                 scheduler="simple", seed=0, chunk_frames=81, moe_boundary=4,
                 i2v_backend="native", frame_rate=16, display_mode="seconds", divisible_by=16,
-                max_side=832, guide_strength="", keyframe_hold=5, model_low=None, clip_vision=None,
+                max_side=832, guide_strength="", keyframe_hold=5, use_prompt_relay=False,
+                model_low=None, clip_vision=None,
                 clip_vision_start=None, clip_vision_end=None) -> io.NodeOutput:
 
         arch, patch_size, _ = detect_model_type(model_high)
@@ -385,8 +392,6 @@ class WanDirector(io.ComfyNode):
             # carried tail stays one frame. encode_wan_keyframes does the in-latent repeat.
             inject = [(fr, img, hold if is_ref else 1) for (fr, img, is_ref) in kf]
 
-            # True multi-segment Prompt Relay: each segment's prompt drives its own latent
-            # sub-window WITHIN this single pass (no per-clip collapse to a uniform mask).
             w_prompts = [p for (p, _l) in win["segments"]]
             w_seg_pix = [l for (_p, l) in win["segments"]]
             full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, w_prompts)
@@ -397,18 +402,25 @@ class WanDirector(io.ComfyNode):
                 inject, clip_vision_outputs=cv_outputs,
             )
 
-            samples = latent["samples"]
-            tokens_per_frame = (samples.shape[3] // patch_size[1]) * (samples.shape[4] // patch_size[2])
-            eff = segment_latent_lengths(w_seg_pix, latent_frames) or \
-                distribute_segment_lengths(len(w_prompts), latent_frames, None)
-            mask_fn = create_mask_fn(build_segments(token_ranges, eff, epsilon, None),
-                                     tokens_per_frame, latent_frames)
-            ph = model_high.clone()
-            apply_patches(ph, arch, mask_fn)
-            pl = None
-            if model_low is not None:
-                pl = model_low.clone()
-                apply_patches(pl, arch, mask_fn)
+            # Prompt Relay (opt-in): temporal cross-attention mask so each segment's prompt
+            # drives its own sub-window. OFF by default — the plain conditioning above is the
+            # most reliable for adherence; relay only helps when segments differ meaningfully.
+            relay_on = use_prompt_relay and sum(1 for p in w_prompts if (p or "").strip()) > 1
+            if relay_on:
+                samples = latent["samples"]
+                tokens_per_frame = (samples.shape[3] // patch_size[1]) * (samples.shape[4] // patch_size[2])
+                eff = segment_latent_lengths(w_seg_pix, latent_frames) or \
+                    distribute_segment_lengths(len(w_prompts), latent_frames, None)
+                mask_fn = create_mask_fn(build_segments(token_ranges, eff, epsilon, None),
+                                         tokens_per_frame, latent_frames)
+                ph = model_high.clone()
+                apply_patches(ph, arch, mask_fn)
+                pl = None
+                if model_low is not None:
+                    pl = model_low.clone()
+                    apply_patches(pl, arch, mask_fn)
+            else:
+                ph, pl = model_high, model_low
 
             sampled = _moe_sample(ph, pl, int(seed) + wi, int(steps), float(cfg),
                                   sampler_name, scheduler, positive, neg_c, latent, moe_boundary)
@@ -416,8 +428,8 @@ class WanDirector(io.ComfyNode):
 
             # Stitch (drop the 1-frame seam each window shares with the previous tail).
             stitched = sout if stitched is None else torch.cat([stitched, sout[:, :, 1:]], dim=2)
-            log.info("[WanDirector] window %d/%d: %d frames, %d segment(s), %d keyframe(s), hold=%d -> %s",
-                     wi + 1, n, w_len, len(w_prompts), len(inject), hold, tuple(stitched.shape))
+            log.info("[WanDirector] window %d/%d: %d frames, %d segment(s), %d keyframe(s), hold=%d relay=%s -> %s",
+                     wi + 1, n, w_len, len(w_prompts), len(inject), hold, relay_on, tuple(stitched.shape))
 
             if wi < n - 1:
                 prev_tail = _decode_tail_start(vae, sout)
