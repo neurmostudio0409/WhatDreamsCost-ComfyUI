@@ -7,15 +7,14 @@ WanDirector does exactly that from the timeline:
 
   - Each keyframe is a hard boundary; segment i = one FLF clip morphing keyframe_i ->
     keyframe_{i+1} (the last segment, and any span longer than chunk_frames, continue as I2V).
-  - Every clip starts from the PREVIOUS clip's last decoded frame -> seg1's tail == seg2's
-    head. The keyframe images drive the morph TARGETS.
-  - Each clip is sampled MoE high->low (encode_wan_keyframes = native FLF conditioning),
-    decoded, and COLOUR-MATCHED to the previous clip's last frame to curb drift (like the
-    ColorMatch node in the Smooth reference).
+  - Continuity is carried in LATENT space (the previous clip's last latent frame seeds the
+    next clip — no decode/re-encode round-trip, so colour stays stable); the keyframe images
+    are the FLF morph TARGETS. Each clip is sampled MoE high->low (encode_wan_keyframes =
+    native FLF conditioning), and the per-clip latents are stitched into one long latent.
   - keyframe_hold pins each reference image across a few frames for stricter adherence.
 
-Decodes internally and OUTPUTS IMAGES — the graph is just
-    loaders → Wan Director → VHS_VideoCombine   (no VAEDecode).
+Outputs one LATENT — the graph is
+    loaders → Wan Director → VAEDecode → VHS_VideoCombine.
 
 Reuses wan_processing.py (encode_wan_keyframes) + ltx_director._load_image_tensor.
 No audio (Wan has none).
@@ -122,7 +121,7 @@ def _plan_clips(prompts, seg_lens, keyframes, total_len, duration_frames, chunk_
 
     Returns clips: ``{"length", "prompt", "start_raw": raw|None, "end_raw": raw|None}``.
       - ``start_raw``: keyframe image to START this clip from — honoured only for clip 0;
-        every later clip starts from the PREVIOUS clip's last decoded frame (continuity).
+        every later clip starts from the PREVIOUS clip's last latent frame (continuity).
       - ``end_raw``: next keyframe image to MORPH TO (FLF); set on the last piece of a span.
     """
     chunk_max = max(5, int(chunk_max))
@@ -180,24 +179,6 @@ def _plan_clips(prompts, seg_lens, keyframes, total_len, duration_frames, chunk_
     return clips
 
 
-def _color_match(images, ref, strength):
-    """Shift ``images`` [T,H,W,C] colour statistics toward ``ref`` (the previous clip's last
-    frame) by ``strength`` (0..1) — per-channel mean/std (Reinhard) match. Curbs the colour
-    drift that accumulates across chained clips, like the ColorMatch node in the reference
-    'Smooth' workflow. Returns clamped [T,H,W,C]."""
-    if ref is None or strength <= 0:
-        return images
-    ref = ref if ref.dim() == 4 else ref.unsqueeze(0)
-    eps = 1e-5
-    im_mean = images.mean(dim=(0, 1, 2), keepdim=True)
-    im_std = images.std(dim=(0, 1, 2), keepdim=True)
-    rf_mean = ref.mean(dim=(0, 1, 2), keepdim=True)
-    rf_std = ref.std(dim=(0, 1, 2), keepdim=True)
-    matched = (images - im_mean) / (im_std + eps) * rf_std + rf_mean
-    s = float(max(0.0, min(1.0, strength)))
-    return (images * (1.0 - s) + matched * s).clamp(0.0, 1.0)
-
-
 def _moe_sample(model_high, model_low, seed, steps, cfg, sampler_name, scheduler,
                 positive, negative, latent, boundary):
     """Two-stage MoE sampling (high-noise then low-noise), mirroring the
@@ -222,10 +203,9 @@ def _moe_sample(model_high, model_low, seed, steps, cfg, sampler_name, scheduler
 class WanDirector(io.ComfyNode):
     """Wan timeline editor with segment-aligned first-last-frame (FLF) chaining.
     Drop an image on each timeline segment; each segment becomes an FLF clip that morphs from
-    its keyframe to the next segment's keyframe, and every clip starts from the previous
-    clip's last decoded frame — so the segments connect (seg1's tail = seg2's head) instead of
-    being independent. Clips are colour-matched to curb drift, decoded internally, and output
-    as IMAGES — feed straight to VHS_VideoCombine (no VAEDecode)."""
+    its keyframe to the next segment's keyframe, chained in LATENT space (the previous clip's
+    last latent frame seeds the next) — so the segments connect (seg1's tail = seg2's head)
+    without colour drift. Outputs one LATENT — feed to VAEDecode → VHS_VideoCombine."""
 
     @classmethod
     def define_schema(cls):
@@ -235,10 +215,9 @@ class WanDirector(io.ComfyNode):
             category="WhatDreamsCost",
             description=(
                 "Wan2.2/2.1 timeline → long video. Each segment is a first-last-frame (FLF) clip that "
-                "morphs from its keyframe to the NEXT segment's keyframe, and each clip starts from the "
-                "previous clip's last frame, so segments connect seamlessly (seg1's tail = seg2's head). "
-                "Samples internally (MoE high→low), colour-matches clips to curb drift, decodes, and "
-                "outputs IMAGES — feed straight to VHS_VideoCombine (no VAEDecode)."
+                "morphs from its keyframe to the NEXT segment's keyframe, chained in latent space so "
+                "segments connect seamlessly (seg1's tail = seg2's head) without colour drift. Samples "
+                "internally (MoE high→low) and outputs one LATENT — feed to VAEDecode → VHS_VideoCombine."
             ),
             inputs=[
                 io.Model.Input("model_high", tooltip="Wan diffusion model. For MoE 14B this is the high-noise model."),
@@ -325,15 +304,15 @@ class WanDirector(io.ComfyNode):
                 io.Boolean.Input("use_prompt_relay", default=False, optional=True,
                                  tooltip="Reserved (no-op in FLF-clip mode): each clip is conditioned on its own "
                                          "segment prompt directly."),
-                io.Float.Input("colormatch_strength", default=0.5, min=0.0, max=1.0, step=0.05, optional=True,
-                               tooltip="Colour-match each clip to the previous clip's last frame (0 = off, 1 = full). "
-                                       "Curbs the colour/feature drift that accumulates across chained FLF clips "
-                                       "(like the ColorMatch node in the 'Smooth' reference workflow). ~0.5 is a good start."),
+                io.Float.Input("colormatch_strength", default=0.0, min=0.0, max=1.0, step=0.05, optional=True,
+                               tooltip="Reserved (no-op). Clips now chain in LATENT space (no per-clip decode), so "
+                                       "there is no decode→re-encode colour drift to correct. Kept for widget-order "
+                                       "compatibility."),
             ],
             outputs=[
-                io.Image.Output(display_name="images",
-                                tooltip="The full decoded video (all FLF clips chained + colour-matched). Feed "
-                                        "straight to VHS_VideoCombine — NO VAEDecode needed (decoding is internal)."),
+                io.Latent.Output(display_name="latent",
+                                 tooltip="The full chained video latent (all FLF clips stitched in latent space). "
+                                         "Feed straight to VAEDecode → VHS_VideoCombine."),
                 io.Float.Output(display_name="frame_rate"),
             ],
         )
@@ -387,35 +366,35 @@ class WanDirector(io.ComfyNode):
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(global_negative_prompt or ""))
         raw_tokenizer = get_raw_tokenizer(clip)
         hold = max(1, int(keyframe_hold))
-        cm_strength = float(colormatch_strength)
 
-        frames_out = None
-        prev_last = None  # previous clip's last DECODED frame [1,H,W,C] (continuity + colour ref)
+        stitched = None
+        prev_latent_tail = None   # previous clip's last LATENT frame (continuity, no VAE round-trip)
+        last_cv = clip_vision_start  # most recent keyframe's CLIP-Vision (carried into continuation)
         for ci, cl in enumerate(clips):
             plen = cl["length"]
 
-            # Start from this clip's own keyframe (clip 0 only) or the previous clip's last
-            # frame; morph to the next keyframe (FLF) when this clip ends a segment.
-            if ci == 0 and cl["start_raw"] is not None:
-                start_image = _load_image_tensor(cl["start_raw"])
-            else:
-                start_image = prev_last
+            # Continuity is carried in LATENT space (prev_latent_tail) — no decode->re-encode
+            # colour drift. Clip 0 starts from its keyframe image; the morph TARGET is the next
+            # keyframe (FLF) on a segment's last piece.
+            start_image = _load_image_tensor(cl["start_raw"]) if (ci == 0 and cl["start_raw"] is not None) else None
             end_image = _load_image_tensor(cl["end_raw"]) if cl["end_raw"] is not None else None
 
-            cv_start = (clip_vision.encode_image(start_image[:1], crop=True)
-                        if (clip_vision is not None and start_image is not None)
-                        else (clip_vision_start if ci == 0 else None))
-            cv_end = (clip_vision.encode_image(end_image[:1], crop=True)
-                      if (clip_vision is not None and end_image is not None) else None)
-
-            # FLF keyframes for this clip: start at frame 0, morph target at the last frame.
             inject, cv_outputs = [], []
             if start_image is not None:
                 inject.append((0, start_image, hold))
-                cv_outputs.append(cv_start)
+                cv = clip_vision.encode_image(start_image[:1], crop=True) if clip_vision is not None else clip_vision_start
+                if cv is not None:
+                    last_cv = cv
+                cv_outputs.append(cv)
             if end_image is not None:
                 inject.append((max(0, plen - 1), end_image, hold))
-                cv_outputs.append(cv_end)
+                cv = clip_vision.encode_image(end_image[:1], crop=True) if clip_vision is not None else None
+                if cv is not None:
+                    last_cv = cv
+                cv_outputs.append(cv)
+            # No image keyframe this clip (pure continuation): keep the last reference anchor.
+            if not cv_outputs and last_cv is not None:
+                cv_outputs = [last_cv]
 
             full_prompt, _tr = map_token_indices(raw_tokenizer, global_prompt, [cl["prompt"]])
             positive = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
@@ -423,22 +402,19 @@ class WanDirector(io.ComfyNode):
             positive, neg_c, latent, _lf = encode_wan_keyframes(
                 positive, negative, vae, tgt_w, tgt_h, plen, batch_size,
                 inject, clip_vision_outputs=cv_outputs,
+                latent_context=(prev_latent_tail if ci > 0 else None),
             )
 
             sampled = _moe_sample(model_high, model_low, int(seed) + ci, int(steps), float(cfg),
                                   sampler_name, scheduler, positive, neg_c, latent, moe_boundary)
-            decoded = vae.decode(sampled["samples"])
-            if decoded.dim() == 5:           # [B,T,H,W,C] -> [T,H,W,C]
-                decoded = decoded[0]
+            sout = sampled["samples"]
 
-            # Colour-match this clip to the previous clip's last frame (drift control).
-            decoded = _color_match(decoded, prev_last, cm_strength)
+            # Stitch latents (drop the 1-frame overlap each clip shares with the previous tail);
+            # decode happens once downstream in VAEDecode.
+            stitched = sout if stitched is None else torch.cat([stitched, sout[:, :, 1:]], dim=2)
+            if ci < n - 1:
+                prev_latent_tail = sout[:, :, -1:]
+            log.info("[WanDirector] clip %d/%d: %d frames, flf=%s prompt=%r -> stitched %s",
+                     ci + 1, n, plen, end_image is not None, (cl["prompt"] or "")[:24], tuple(stitched.shape))
 
-            # Append, dropping the 1-frame overlap shared with the previous clip's tail.
-            piece = decoded if frames_out is None else decoded[1:]
-            frames_out = piece if frames_out is None else torch.cat([frames_out, piece], dim=0)
-            prev_last = frames_out[-1:].clone()
-            log.info("[WanDirector] clip %d/%d: %d frames, flf=%s prompt=%r -> total %d",
-                     ci + 1, n, plen, end_image is not None, (cl["prompt"] or "")[:24], frames_out.shape[0])
-
-        return io.NodeOutput(frames_out, float(frame_rate))
+        return io.NodeOutput({"samples": stitched}, float(frame_rate))
