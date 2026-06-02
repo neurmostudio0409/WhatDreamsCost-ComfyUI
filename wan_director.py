@@ -54,79 +54,117 @@ def _snap_len(n):
     return max(5, ((n - 1) // WAN_STRIDE) * WAN_STRIDE + 1)
 
 
-def _parse_timeline(timeline_data, duration_frames):
-    """All timeline segments (in order) with their prompt, length, and image (if any).
-    Each segment is a KEYFRAME region: its image anchors that part of the video."""
+def _largest_remainder(weights, total):
+    """Distribute integer ``total`` across len(weights) buckets proportional to weights,
+    summing EXACTLY to ``total`` (largest-remainder rounding). No frames are lost."""
+    s = float(sum(weights)) or 1.0
+    exact = [w / s * total for w in weights]
+    base = [int(e) for e in exact]
+    rem = int(total - sum(base))
+    order = sorted(range(len(weights)), key=lambda i: exact[i] - base[i], reverse=True)
+    for k in range(max(0, rem)):
+        base[order[k % len(order)]] += 1
+    return base
+
+
+def _parse_relay_segments(local_prompts, segment_lengths, timeline_data, duration_frames):
+    """Prompt-relay segments — (prompts, pixel_lengths) — preferring the JS-computed
+    ``local_prompts`` (|-separated) + ``segment_lengths`` (,-separated). That is the exact
+    contract the working LTXDirector consumes: contiguous regions, gaps merged, padded to
+    the duration. Falls back to timeline_data segment prompts/lengths if those are empty."""
+    prompts = [p.strip() for p in local_prompts.split("|")] if (local_prompts or "").strip() else []
+    lens = []
+    if (segment_lengths or "").strip():
+        for x in segment_lengths.split(","):
+            x = x.strip()
+            if x:
+                try:
+                    lens.append(max(1, int(float(x))))
+                except ValueError:
+                    pass
+    if prompts and lens and len(prompts) == len(lens):
+        return prompts, lens
+
+    try:
+        tdata = json.loads(timeline_data) if timeline_data else {}
+    except (ValueError, TypeError):
+        tdata = {}
+    segs = []
+    for s in tdata.get("segments", []):
+        if s.get("type") in ("temp", "ghost", "audio"):
+            continue
+        st = int(s.get("start", 0))
+        if st >= duration_frames:
+            continue
+        segs.append((st, max(1, int(s.get("length", 1))), (s.get("prompt") or "").strip()))
+    segs.sort(key=lambda x: x[0])
+    return [p for (_s, _l, p) in segs], [l for (_s, l, _p) in segs]
+
+
+def _parse_keyframes(timeline_data, duration_frames):
+    """Image keyframes ``[(start_frame, raw_segment)]`` from the timeline — image-bearing
+    visual segments only (skips temp/ghost/audio and prompt-only segments)."""
     try:
         tdata = json.loads(timeline_data) if timeline_data else {}
     except (ValueError, TypeError):
         return []
     out = []
     for s in tdata.get("segments", []):
-        if int(s.get("start", 0)) >= duration_frames:
+        if s.get("type") in ("temp", "ghost", "audio"):
             continue
-        out.append({
-            "start": int(s.get("start", 0)),
-            "length": max(1, int(s.get("length", 1))),
-            "prompt": (s.get("prompt") or "").strip(),
-            "raw": s,
-            "has_img": bool(s.get("imageFile") or s.get("imageB64")),
-        })
-    out.sort(key=lambda x: x["start"])
+        if not (s.get("imageFile") or s.get("imageB64")):
+            continue
+        st = int(s.get("start", 0))
+        if st >= duration_frames:
+            continue
+        out.append((st, s))
+    out.sort(key=lambda x: x[0])
     return out
 
 
-def _plan_windows(segs, total_len, chunk_max):
-    """Group whole timeline segments into render WINDOWS of <= chunk_max frames.
+def _plan_windows(prompts, seg_lens, keyframes, total_len, duration_frames, chunk_max):
+    """Cut the timeline into render WINDOWS of <= chunk_max frames, PRESERVING total length
+    (a span longer than one pass is SPLIT across windows, never truncated). The prompt-relay
+    regions and the image keyframes are mapped onto each window independently.
 
-    Each window is generated in a SINGLE multi-keyframe pass (all its keyframes injected
-    into one latent + true multi-segment Prompt Relay), so motion is continuous across
-    the segments inside a window — the fix for "segments look like independent clips".
-    Windows are only introduced when the timeline is longer than one Wan pass; adjacent
-    windows are bridged (shared boundary keyframe + carried latent tail).
-
-    Returns a list of windows, each::
-
-        {"length": int,                       # window length in (pixel) frames
-         "segments": [(prompt, local_len)],    # for the prompt-relay temporal mask
-         "keyframes": [(local_frame, raw)],    # interior segment images to inject
-         "bridge_next_raw": raw | None}        # next window's first image (end anchor)
-
-    The window's frame 0 keyframe is handled by the caller: the first window starts from
-    its first segment image; later windows start from the previous window's decoded tail.
+    Returns windows: ``{"length", "segments": [(prompt, local_len)], "keyframes": [(local_frame, raw)]}``.
+    A window's frame 0 is a keyframe at local 0 (segment boundary) or — in later windows —
+    the previous window's carried latent tail (decided by the caller).
     """
-    sum_len = sum(s["length"] for s in segs) or 1
-    scale = total_len / sum_len
-    glob, cursor = [], 0
-    for s in segs:
-        L = max(_snap_len(1), int(round(s["length"] * scale)))
-        glob.append({"start": cursor, "len": L, "raw": s["raw"],
-                     "has_img": s["has_img"], "prompt": s["prompt"]})
-        cursor += L
+    chunk_max = max(5, int(chunk_max))
 
-    windows, i, N = [], 0, len(glob)
-    while i < N:
-        w_start = glob[i]["start"]
-        j = i
-        while j < N and (glob[j]["start"] + glob[j]["len"] - w_start) <= chunk_max:
-            j += 1
-        if j == i:           # a single segment longer than chunk_max -> take it (capped)
-            j = i + 1
-        members = glob[i:j]
-        w_len = _snap_len(min(sum(g["len"] for g in members), chunk_max))
-        segments = [(g["prompt"], g["len"]) for g in members]
-        # Interior keyframes: every member after the first (the first member's image is
-        # the window's frame-0 anchor, handled by the caller / bridged from the prev tail).
-        keyframes = [(g["start"] - w_start, g["raw"]) for g in members[1:] if g["has_img"]]
-        nxt = glob[j] if j < N else None
-        windows.append({
-            "length": w_len,
-            "segments": segments,
-            "keyframes": keyframes,
-            "first_raw": members[0]["raw"] if members[0]["has_img"] else None,
-            "bridge_next_raw": nxt["raw"] if (nxt and nxt["has_img"]) else None,
-        })
-        i = j
+    # Prompt regions scaled to exactly total_len (no rounding drift).
+    glens = _largest_remainder([max(1, l) for l in seg_lens], total_len) if seg_lens else [total_len]
+    rprompts = list(prompts) if prompts else [""]
+    if len(rprompts) != len(glens):
+        rprompts = (rprompts + [""] * len(glens))[:len(glens)]
+    regions, c = [], 0
+    for p, L in zip(rprompts, glens):
+        if L <= 0:
+            continue
+        regions.append((c, c + L, p))
+        c += L
+    if not regions:
+        regions = [(0, total_len, "")]
+
+    # Keyframe positions mapped from timeline (duration_frames) space into total_len space.
+    dur = max(1, int(duration_frames))
+    kf_pos = sorted(
+        (max(0, min(int(round(st * total_len / dur)), total_len - 1)), raw)
+        for (st, raw) in keyframes
+    )
+
+    windows, pos = [], 0
+    while pos < total_len:
+        remaining = total_len - pos
+        wlen = remaining if remaining <= chunk_max else _snap_len(chunk_max)
+        wlen = max(1, min(wlen, remaining))
+        wstart, wend = pos, pos + wlen
+        wsegs = [(p, min(b, wend) - max(a, wstart))
+                 for (a, b, p) in regions if min(b, wend) > max(a, wstart)]
+        wkfs = [(f - wstart, raw) for (f, raw) in kf_pos if wstart <= f < wend]
+        windows.append({"length": wlen, "segments": wsegs or [("", wlen)], "keyframes": wkfs})
+        pos = wend
     return windows
 
 
@@ -241,9 +279,10 @@ class WanDirector(io.ComfyNode):
                                        "(encode_wan_keyframes) for single-pass multi-keyframe transitions; this "
                                        "selector is kept for widget-order compatibility and a future fmlf backend."),
                 io.Float.Input("frame_rate", default=16, min=1, max=240, step=1, optional=True,
-                               tooltip="Playback fps. Wan generates ~81 frames per pass; at 16 fps that is ~5s "
-                                       "(matches the REMIX reference), at 24 fps ~3.4s. Lower fps = longer, more "
-                                       "cinematic clips. Pair with RIFE downstream to interpolate back up for smoothness."),
+                               tooltip="Playback fps. Each chained piece spans chunk_frames÷frame_rate seconds, so at "
+                                       "the default 81÷16≈5s per piece (24 fps would be ~3.4s). The timeline editor "
+                                       "also converts its seconds<->frames with THIS value, so total duration still "
+                                       "matches what you set. Pair with RIFE downstream to interpolate back up for smoothness."),
                 io.Combo.Input("display_mode", options=["frames", "seconds"], default="seconds", optional=True),
                 io.Int.Input("divisible_by", default=16, min=1, max=256, step=1, optional=True,
                              tooltip="Snap auto-detected dimensions to a multiple of this (Wan2.1: 16, 2.2-5B: 32)."),
@@ -286,27 +325,32 @@ class WanDirector(io.ComfyNode):
         if vae is None:
             raise ValueError("WanDirector: a Wan VAE is required (encodes images, decodes seams).")
 
-        # --- Parse timeline segments (each = a keyframe region: image + prompt + length) ---
-        segs = _parse_timeline(timeline_data, duration_frames)
-        if not segs:
-            raise ValueError("WanDirector: the timeline is empty. Add at least one segment (image + prompt).")
-        for s in segs:
-            if not s["prompt"]:
-                raise ValueError("There is a segment on the timeline missing a prompt!")
+        # --- Parse the timeline. Prompt-relay segments come from the JS-computed
+        #     local_prompts/segment_lengths (the proven LTXDirector contract); image
+        #     keyframes are read separately from timeline_data. The two are decoupled. ---
+        prompts, seg_lens = _parse_relay_segments(local_prompts, segment_lengths,
+                                                  timeline_data, duration_frames)
+        keyframes = _parse_keyframes(timeline_data, duration_frames)
+        if not keyframes and not any((p or "").strip() for p in prompts):
+            raise ValueError("WanDirector: the timeline is empty. Add at least one segment "
+                             "(image keyframe and/or prompt).")
 
-        # --- Total length (0 = follow timeline), then dimensions from the first keyframe ---
-        total_len = int(length) if length and int(length) > 0 else _snap_len(int(duration_frames))
-        total_len = _snap_len(total_len)
-        first_img_seg = next((s for s in segs if s["has_img"]), None)
-        first_image = _load_image_tensor(first_img_seg["raw"]) if first_img_seg else None
+        # --- Total length (0 = follow timeline). Prefer the segment-length sum so the prompt
+        #     regions map exactly; else the timeline duration. Length is PRESERVED (windows
+        #     split, never truncate). ---
+        if length and int(length) > 0:
+            total_len = _snap_len(int(length))
+        else:
+            total_len = _snap_len(sum(seg_lens) if seg_lens else int(duration_frames))
+        first_image = _load_image_tensor(keyframes[0][1]) if keyframes else None
         tgt_w, tgt_h = resolve_wan_dims(first_image, width, height, divisible_by, max_side)
 
         # --- Plan render windows: each window is ONE multi-keyframe single pass; only a
         #     timeline longer than one Wan pass spans multiple (bridged) windows. ---
-        windows = _plan_windows(segs, total_len, chunk_frames)
+        windows = _plan_windows(prompts, seg_lens, keyframes, total_len, duration_frames, chunk_frames)
         n = len(windows)
-        log.info("[WanDirector] %d segment(s) -> %d window(s), total~%d frames, %dx%d",
-                 len(segs), n, total_len, tgt_w, tgt_h)
+        log.info("[WanDirector] %d prompt-seg, %d keyframe(s) -> %d window(s), total~%d frames, %dx%d",
+                 len(prompts), len(keyframes), n, total_len, tgt_w, tgt_h)
 
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(global_negative_prompt or ""))
         raw_tokenizer = get_raw_tokenizer(clip)
@@ -317,20 +361,15 @@ class WanDirector(io.ComfyNode):
         for wi, win in enumerate(windows):
             w_len = win["length"]
 
-            # Keyframes injected into this single pass: frame-0 anchor, interior segment
-            # images, and an end anchor bridging to the next window (cross-window continuity).
-            # Each entry: (local_frame, image_tensor, is_reference). A carried tail is a
-            # continuation (is_reference=False), so it is not "held".
+            # Keyframes injected into this single pass. Each: (local_frame, image, is_reference).
+            # If no keyframe sits at this window's start, a later window carries the previous
+            # window's decoded tail at frame 0 for continuity (a continuation, not "held").
             kf = []
-            if wi == 0:
-                if win["first_raw"] is not None:
-                    kf.append((0, _load_image_tensor(win["first_raw"]), True))
-            elif prev_tail is not None:
+            wkfs = win["keyframes"]
+            if wi > 0 and prev_tail is not None and not any(int(lf) == 0 for (lf, _r) in wkfs):
                 kf.append((0, prev_tail, False))
-            for (lf, raw) in win["keyframes"]:
+            for (lf, raw) in wkfs:
                 kf.append((int(lf), _load_image_tensor(raw), True))
-            if win["bridge_next_raw"] is not None:
-                kf.append((max(0, w_len - 1), _load_image_tensor(win["bridge_next_raw"]), True))
 
             # CLIP-Vision per keyframe (encode the single frame; the semantic anchor).
             cv_outputs = []
@@ -348,9 +387,9 @@ class WanDirector(io.ComfyNode):
 
             # True multi-segment Prompt Relay: each segment's prompt drives its own latent
             # sub-window WITHIN this single pass (no per-clip collapse to a uniform mask).
-            prompts = [p for (p, _l) in win["segments"]]
-            seg_pix = [l for (_p, l) in win["segments"]]
-            full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, prompts)
+            w_prompts = [p for (p, _l) in win["segments"]]
+            w_seg_pix = [l for (_p, l) in win["segments"]]
+            full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, w_prompts)
             positive = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
 
             positive, neg_c, latent, latent_frames = encode_wan_keyframes(
@@ -360,8 +399,8 @@ class WanDirector(io.ComfyNode):
 
             samples = latent["samples"]
             tokens_per_frame = (samples.shape[3] // patch_size[1]) * (samples.shape[4] // patch_size[2])
-            eff = segment_latent_lengths(seg_pix, latent_frames) or \
-                distribute_segment_lengths(len(prompts), latent_frames, None)
+            eff = segment_latent_lengths(w_seg_pix, latent_frames) or \
+                distribute_segment_lengths(len(w_prompts), latent_frames, None)
             mask_fn = create_mask_fn(build_segments(token_ranges, eff, epsilon, None),
                                      tokens_per_frame, latent_frames)
             ph = model_high.clone()
@@ -378,7 +417,7 @@ class WanDirector(io.ComfyNode):
             # Stitch (drop the 1-frame seam each window shares with the previous tail).
             stitched = sout if stitched is None else torch.cat([stitched, sout[:, :, 1:]], dim=2)
             log.info("[WanDirector] window %d/%d: %d frames, %d segment(s), %d keyframe(s), hold=%d -> %s",
-                     wi + 1, n, w_len, len(prompts), len(inject), hold, tuple(stitched.shape))
+                     wi + 1, n, w_len, len(w_prompts), len(inject), hold, tuple(stitched.shape))
 
             if wi < n - 1:
                 prev_tail = _decode_tail_start(vae, sout)
