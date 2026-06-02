@@ -141,6 +141,80 @@ def build_wan_latent(vae, width, height, length, batch_size=1, device=None):
     return {"samples": samples}, latent_t
 
 
+def encode_wan_keyframes(positive, negative, vae, width, height, length, batch_size,
+                         keyframes, clip_vision_outputs=None):
+    """Native N-keyframe injection — the generalisation of ``WanFirstLastFrameToVideo``
+    to an ARBITRARY number of keyframes at arbitrary frame positions.
+
+    Builds a single gray pixel buffer, drops each keyframe image at its frame index,
+    VAE-encodes the whole thing as ``concat_latent_image`` and marks those frames
+    *known* (mask = 0) in the concat mask. One sampling pass over this latent therefore
+    passes through every keyframe in order — i.e. smooth transitions in one generation,
+    exactly how the FLF / FMLF reference nodes work (no independent per-segment clips).
+
+    ``keyframes``: list of ``(frame_index, image_tensor[F,H,W,C], hold_frames)``. Only the
+    first frame of each image is used; it is held for ``hold_frames`` frames so the mask
+    pins ``((hold-1)//4)+1`` latent frames (reference-adherence lever).
+    ``clip_vision_outputs``: optional list (one per keyframe, None allowed) — concatenated
+    along the token dim the same way FLF concatenates its start+end CLIP-Vision outputs.
+
+    Returns ``(positive, negative, latent_dict, latent_t)``.
+    """
+    import torch
+    import comfy.utils
+    import comfy.model_management
+    import comfy.clip_vision
+    import node_helpers
+
+    sp = _vae_spatial_scale(vae)
+    ch = _vae_channels(vae)
+    latent_t = pixel_to_latent_len(length)
+    h_lat, w_lat = int(height) // sp, int(width) // sp
+    latent = torch.zeros([int(batch_size), ch, latent_t, h_lat, w_lat],
+                         device=comfy.model_management.intermediate_device())
+
+    # Gray buffer (matches the native nodes' 0.5 fill) + pixel-time known-mask.
+    image = torch.ones((length, int(height), int(width), 3)) * 0.5
+    mask = torch.ones((1, 1, latent_t * 4, h_lat, w_lat))
+
+    for fidx, img, hold in keyframes:
+        if img is None:
+            continue
+        up = comfy.utils.common_upscale(img[:1].movedim(-1, 1), int(width), int(height),
+                                        "bilinear", "center").movedim(1, -1)
+        f0 = max(0, min(int(fidx), length - 1))
+        f1 = min(length, f0 + max(1, int(hold)))
+        image[f0:f1] = up[0]
+        # Mark every latent temporal patch (stride 4) the keyframe touches as known.
+        m0 = (f0 // 4) * 4
+        m1 = min(latent_t * 4, ((f1 - 1) // 4 + 1) * 4)
+        mask[:, :, m0:m1] = 0.0
+
+    concat_latent_image = vae.encode(image[:, :, :, :3])
+    # Pixel-time mask -> latent-time with Wan's 4-frame temporal patchify.
+    mask = mask.view(1, mask.shape[2] // 4, 4, mask.shape[3], mask.shape[4]).transpose(1, 2)
+
+    positive = node_helpers.conditioning_set_values(
+        positive, {"concat_latent_image": concat_latent_image, "concat_mask": mask})
+    negative = node_helpers.conditioning_set_values(
+        negative, {"concat_latent_image": concat_latent_image, "concat_mask": mask})
+
+    # CLIP-Vision: concatenate every keyframe's output (N-way generalisation of FLF).
+    cv = None
+    outs = [o for o in (clip_vision_outputs or []) if o is not None]
+    if len(outs) == 1:
+        cv = outs[0]
+    elif len(outs) > 1:
+        states = torch.cat([o.penultimate_hidden_states for o in outs], dim=-2)
+        cv = comfy.clip_vision.Output()
+        cv.penultimate_hidden_states = states
+    if cv is not None:
+        positive = node_helpers.conditioning_set_values(positive, {"clip_vision_output": cv})
+        negative = node_helpers.conditioning_set_values(negative, {"clip_vision_output": cv})
+
+    return positive, negative, {"samples": latent}, latent_t
+
+
 def encode_wan_i2v(positive, negative, vae, width, height, length, batch_size=1,
                    start_image=None, end_image=None,
                    clip_vision_start=None, clip_vision_end=None,

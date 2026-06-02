@@ -3871,6 +3871,19 @@ app.registerExtension({
           }, 0);
         }
 
+        // Hide global negative prompt by default on creation too (WanDirector only) ->
+        // the "Use Global Negative Prompt" toggle therefore starts OFF.
+        const globalNegPromptWidget = this.widgets?.find(w => w.name === "global_negative_prompt");
+        if (globalNegPromptWidget) {
+          if (!globalNegPromptWidget.options) globalNegPromptWidget.options = {};
+          globalNegPromptWidget.options.hidden = true;
+          globalNegPromptWidget.hidden = true;
+          globalNegPromptWidget.computeSize = () => [0, 0];
+          setTimeout(() => {
+            if (globalNegPromptWidget.element) globalNegPromptWidget.element.style.display = "none";
+          }, 0);
+        }
+
         const container = document.createElement("div");
         const widget = this.addDOMWidget("timeline_ui", "timeline_ui", container, {
           getValue: () => "",

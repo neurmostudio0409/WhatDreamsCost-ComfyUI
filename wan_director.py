@@ -1,24 +1,28 @@
-"""WanDirector — Wan2.2/2.1 timeline node with Prompt Relay + internal chunked
-long-video generation (v3).
+"""WanDirector — Wan2.2/2.1 timeline node with Prompt Relay + single-pass
+multi-keyframe generation (v2.5).
 
-Wan I2V is a single-pass model (~5s / ~81 frames). To give the LTX-Director
-experience — one timeline → an arbitrarily long video — WanDirector does the
-segmentation ITSELF, on the backend, KEYFRAME-driven:
+The reference FLF / FMLF workflows get smooth transitions by injecting ALL their
+keyframes into ONE latent and sampling ONCE — never by gluing independently-sampled
+clips. WanDirector does the same, generalised to an arbitrary number of keyframes:
 
-  - Each timeline segment is a keyframe region: its image anchors that part of
-    the video, its prompt drives that part.
-  - A segment is sub-split into <= chunk_frames pieces. Its first piece starts
-    from the segment's image (the keyframe); later pieces chain from the previous
-    decoded tail; the last piece morphs to the NEXT segment's image via
-    first-last-frame (FLF) — so the video passes through every keyframe in order.
-  - Each piece is generated as a Wan I2V/FLF (MoE high→low sampling, internal).
-  - All piece latents are stitched (1-frame seam dropped) into one long latent.
+  - The timeline is grouped into render WINDOWS of <= chunk_frames each. A short
+    timeline (the common case) is a single window = one pass.
+  - Every keyframe in a window is injected into one latent at its frame position
+    (wan_processing.encode_wan_keyframes, the N-keyframe generalisation of
+    WanFirstLastFrameToVideo) and the window is sampled ONCE (MoE high→low),
+    so motion is continuous across the segments inside it.
+  - Within a window, TRUE multi-segment Prompt Relay applies: each segment's prompt
+    drives its own latent sub-window (no collapse to a uniform per-clip mask).
+  - keyframe_hold pins each reference image across a few frames for stricter adherence.
+  - Only timelines longer than one pass span multiple windows; adjacent windows are
+    bridged (shared boundary keyframe + carried latent tail) and stitched (1-frame
+    seam dropped) into one long latent.
 
 So it absorbs the two KSamplerAdvanced: the graph is just
     loaders → Wan Director → VAEDecode → VideoCombine.
 
-Reuses prompt_relay.py + patches.py (already Wan-aware) + wan_processing.py
-(delegates latent/I2V conditioning to native Wan nodes). No audio (Wan has none).
+Reuses prompt_relay.py + patches.py (already Wan-aware) + wan_processing.py.
+No audio (Wan has none).
 """
 import json
 import logging
@@ -36,7 +40,7 @@ from .prompt_relay import (
     distribute_segment_lengths,
 )
 from .patches import detect_model_type, apply_patches
-from .wan_processing import resolve_wan_dims, encode_wan_i2v, segment_latent_lengths
+from .wan_processing import resolve_wan_dims, encode_wan_keyframes, segment_latent_lengths
 from .ltx_director import _load_image_tensor  # generic image loader (reused)
 
 log = logging.getLogger(__name__)
@@ -72,42 +76,58 @@ def _parse_timeline(timeline_data, duration_frames):
     return out
 
 
-def _plan_pieces(seg_len, chunk_max):
-    """Split one segment's frame length into evenly-sized pieces of <= chunk_max
-    (valid Wan lengths) — avoids tiny remainder pieces that make abrupt FLF morphs."""
-    seg_len = max(1, int(seg_len))
-    chunk_max = max(5, int(chunk_max))
-    if seg_len <= chunk_max:
-        return [_snap_len(seg_len)]
-    n = (seg_len + chunk_max - 1) // chunk_max  # ceil
-    base = max(5, seg_len // n)
-    return [_snap_len(base) for _ in range(n)]
+def _plan_windows(segs, total_len, chunk_max):
+    """Group whole timeline segments into render WINDOWS of <= chunk_max frames.
 
+    Each window is generated in a SINGLE multi-keyframe pass (all its keyframes injected
+    into one latent + true multi-segment Prompt Relay), so motion is continuous across
+    the segments inside a window — the fix for "segments look like independent clips".
+    Windows are only introduced when the timeline is longer than one Wan pass; adjacent
+    windows are bridged (shared boundary keyframe + carried latent tail).
 
-def _build_chunk_specs(segs, total_len, chunk_max):
-    """Turn timeline segments into a flat list of chunk specs.
+    Returns a list of windows, each::
 
-    Each segment's image anchors its first piece (the keyframe). Within a segment
-    longer than chunk_max, later pieces chain from the previous decoded tail. The
-    LAST piece of a segment morphs to the NEXT segment's image via first-last-frame
-    (FLF), so the video passes through every keyframe in order.
+        {"length": int,                       # window length in (pixel) frames
+         "segments": [(prompt, local_len)],    # for the prompt-relay temporal mask
+         "keyframes": [(local_frame, raw)],    # interior segment images to inject
+         "bridge_next_raw": raw | None}        # next window's first image (end anchor)
+
+    The window's frame 0 keyframe is handled by the caller: the first window starts from
+    its first segment image; later windows start from the previous window's decoded tail.
     """
     sum_len = sum(s["length"] for s in segs) or 1
     scale = total_len / sum_len
-    specs = []
-    for k, s in enumerate(segs):
-        seg_len = max(_snap_len(1), int(round(s["length"] * scale)))
-        nxt = segs[k + 1] if k + 1 < len(segs) else None
-        next_img_raw = nxt["raw"] if (nxt and nxt["has_img"]) else None
-        pieces = _plan_pieces(seg_len, chunk_max)
-        for pi, plen in enumerate(pieces):
-            specs.append({
-                "prompt": s["prompt"],
-                "length": plen,
-                "start_raw": s["raw"] if (pi == 0 and s["has_img"]) else None,  # None -> chain from tail
-                "end_raw": next_img_raw if pi == len(pieces) - 1 else None,     # FLF morph to next keyframe
-            })
-    return specs
+    glob, cursor = [], 0
+    for s in segs:
+        L = max(_snap_len(1), int(round(s["length"] * scale)))
+        glob.append({"start": cursor, "len": L, "raw": s["raw"],
+                     "has_img": s["has_img"], "prompt": s["prompt"]})
+        cursor += L
+
+    windows, i, N = [], 0, len(glob)
+    while i < N:
+        w_start = glob[i]["start"]
+        j = i
+        while j < N and (glob[j]["start"] + glob[j]["len"] - w_start) <= chunk_max:
+            j += 1
+        if j == i:           # a single segment longer than chunk_max -> take it (capped)
+            j = i + 1
+        members = glob[i:j]
+        w_len = _snap_len(min(sum(g["len"] for g in members), chunk_max))
+        segments = [(g["prompt"], g["len"]) for g in members]
+        # Interior keyframes: every member after the first (the first member's image is
+        # the window's frame-0 anchor, handled by the caller / bridged from the prev tail).
+        keyframes = [(g["start"] - w_start, g["raw"]) for g in members[1:] if g["has_img"]]
+        nxt = glob[j] if j < N else None
+        windows.append({
+            "length": w_len,
+            "segments": segments,
+            "keyframes": keyframes,
+            "first_raw": members[0]["raw"] if members[0]["has_img"] else None,
+            "bridge_next_raw": nxt["raw"] if (nxt and nxt["has_img"]) else None,
+        })
+        i = j
+    return windows
 
 
 def _moe_sample(model_high, model_low, seed, steps, cfg, sampler_name, scheduler,
@@ -141,10 +161,11 @@ def _decode_tail_start(vae, samples):
 
 
 class WanDirector(io.ComfyNode):
-    """Wan timeline editor with Prompt Relay and internal long-video generation.
-    Drop an image at the start of the timeline for I2V (start + end = FLF); prompt
-    segments drive the content along the timeline. Long timelines are generated as
-    chained <=chunk_frames chunks and stitched into one latent — no manual chaining."""
+    """Wan timeline editor with Prompt Relay and single-pass multi-keyframe generation.
+    Drop an image on each timeline segment; ALL keyframes that fit one pass are injected
+    into a single latent and sampled once (smooth transitions, like FLF/FMLF), with each
+    segment's prompt driving its own time window. Only timelines longer than one pass span
+    multiple bridged windows, stitched into one latent — no manual chaining."""
 
     @classmethod
     def define_schema(cls):
@@ -154,9 +175,9 @@ class WanDirector(io.ComfyNode):
             category="WhatDreamsCost",
             description=(
                 "Wan2.2/2.1 timeline editor with Prompt Relay. The timeline duration sets the "
-                "video length; longer-than-one-pass timelines are generated as chained chunks and "
-                "stitched automatically (Wan I2V is single-pass ~5s). Samples internally (MoE "
-                "high→low) and outputs one long latent — feed it straight to VAEDecode."
+                "video length; all keyframes that fit one pass are injected into a single latent "
+                "and sampled once for smooth transitions (longer timelines span bridged windows). "
+                "Samples internally (MoE high→low) and outputs one long latent — feed it to VAEDecode."
             ),
             inputs=[
                 io.Model.Input("model_high", tooltip="Wan diffusion model. For MoE 14B this is the high-noise model."),
@@ -184,9 +205,9 @@ class WanDirector(io.ComfyNode):
                              tooltip="0 = auto-detect from the start image (snapped to divisible_by). Set for T2V."),
                 io.Int.Input("length", default=0, min=0, max=100000, step=4,
                              tooltip="Total video length in frames. 0 = follow the timeline duration (like LTX). "
-                                     "Longer than chunk_frames is split into chained chunks automatically."),
+                                     "Longer than chunk_frames spans multiple bridged windows automatically."),
                 io.Int.Input("batch_size", default=1, min=1, max=4096,
-                             tooltip="Keep at 1 for chained (multi-chunk) generation."),
+                             tooltip="Keep at 1 for multi-window (long-video) generation."),
                 io.Int.Input("duration_frames", default=120, min=1, max=100000, step=1,
                              tooltip="Timeline length in frames (drives total length when length = 0)."),
                 io.Float.Input("duration_seconds", default=5.0, min=0.1, max=10000.0, step=0.01,
@@ -200,23 +221,29 @@ class WanDirector(io.ComfyNode):
                 io.Float.Input("epsilon", default=0.001, min=0.0001, max=0.99, step=0.0001,
                                tooltip="Prompt Relay penalty decay (paper default 0.001)."),
                 io.Int.Input("steps", default=8, min=1, max=200,
-                             tooltip="Sampling steps per chunk."),
+                             tooltip="Sampling steps per window."),
                 io.Float.Input("cfg", default=1.0, min=0.0, max=30.0, step=0.1,
                                tooltip="CFG scale. 1.0 with a lightx2v-style distill LoRA."),
                 io.Combo.Input("sampler_name", options=comfy.samplers.KSampler.SAMPLERS, default="euler"),
                 io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="simple"),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff,
-                             tooltip="Base noise seed (each chunk uses seed + chunk index)."),
+                             tooltip="Base noise seed (each window uses seed + window index)."),
                 io.Int.Input("chunk_frames", default=81, min=5, max=10000, step=4,
-                             tooltip="Max frames generated per single Wan pass before chaining (~81 for 14B)."),
+                             tooltip="Max frames per single Wan pass = one render window (~81 for 14B). All "
+                                     "keyframes within a window share one continuous pass; raise it to keep more "
+                                     "segments in one smooth window (slower, more VRAM)."),
                 io.Int.Input("moe_boundary", default=4, min=1, max=200,
                              tooltip="Step at which sampling switches from the high-noise to the low-noise model "
                                      "(ignored if model_low is unconnected)."),
                 # --- optional widgets ---
                 io.Combo.Input("i2v_backend", options=["native", "fmlf"], default="native", optional=True,
-                               tooltip="I2V conditioning backend. native = WanImageToVideo/FLF (no deps). "
-                                       "fmlf = Wan22FMLF WanAdvancedI2V (falls back to native if absent)."),
-                io.Float.Input("frame_rate", default=24, min=1, max=240, step=1, optional=True),
+                               tooltip="Reserved. The generator now uses native N-keyframe injection "
+                                       "(encode_wan_keyframes) for single-pass multi-keyframe transitions; this "
+                                       "selector is kept for widget-order compatibility and a future fmlf backend."),
+                io.Float.Input("frame_rate", default=16, min=1, max=240, step=1, optional=True,
+                               tooltip="Playback fps. Wan generates ~81 frames per pass; at 16 fps that is ~5s "
+                                       "(matches the REMIX reference), at 24 fps ~3.4s. Lower fps = longer, more "
+                                       "cinematic clips. Pair with RIFE downstream to interpolate back up for smoothness."),
                 io.Combo.Input("display_mode", options=["frames", "seconds"], default="seconds", optional=True),
                 io.Int.Input("divisible_by", default=16, min=1, max=256, step=1, optional=True,
                              tooltip="Snap auto-detected dimensions to a multiple of this (Wan2.1: 16, 2.2-5B: 32)."),
@@ -226,6 +253,13 @@ class WanDirector(io.ComfyNode):
                                      "the image's native size; can be very slow for large images)."),
                 io.String.Input("guide_strength", default="", optional=True,
                                 tooltip="Unused for Wan; kept for shared timeline-JS compatibility."),
+                io.Int.Input("keyframe_hold", default=5, min=1, max=81, step=1, optional=True,
+                             tooltip="How many frames to PIN each keyframe (reference image) as known. "
+                                     "Higher = stricter adherence to the reference image, at the cost of a "
+                                     "brief hold/freeze on that keyframe. Native Wan pins ((hold-1)//4)+1 "
+                                     "latent frames: 1 = single frame (loosest), 5 ≈ pin 2 latent frames, "
+                                     "9 ≈ 3. On a first-last (FLF) chunk it is capped to half the chunk so "
+                                     "there is room to move between the two keyframes."),
             ],
             outputs=[
                 io.Latent.Output(display_name="latent",
@@ -239,8 +273,8 @@ class WanDirector(io.ComfyNode):
                 length, batch_size, duration_frames, duration_seconds, timeline_data, local_prompts,
                 segment_lengths, epsilon=1e-3, steps=8, cfg=1.0, sampler_name="euler",
                 scheduler="simple", seed=0, chunk_frames=81, moe_boundary=4,
-                i2v_backend="native", frame_rate=24, display_mode="seconds", divisible_by=16,
-                max_side=832, guide_strength="", model_low=None, clip_vision=None,
+                i2v_backend="native", frame_rate=16, display_mode="seconds", divisible_by=16,
+                max_side=832, guide_strength="", keyframe_hold=5, model_low=None, clip_vision=None,
                 clip_vision_start=None, clip_vision_end=None) -> io.NodeOutput:
 
         arch, patch_size, _ = detect_model_type(model_high)
@@ -267,46 +301,67 @@ class WanDirector(io.ComfyNode):
         first_image = _load_image_tensor(first_img_seg["raw"]) if first_img_seg else None
         tgt_w, tgt_h = resolve_wan_dims(first_image, width, height, divisible_by, max_side)
 
-        # --- Build chunk specs: each segment's image anchors its region; FLF morph to next keyframe ---
-        specs = _build_chunk_specs(segs, total_len, chunk_frames)
-        n = len(specs)
-        log.info("[WanDirector] %d segment(s) -> %d chunk(s), total~%d frames, %dx%d, backend=%s",
-                 len(segs), n, total_len, tgt_w, tgt_h, i2v_backend)
+        # --- Plan render windows: each window is ONE multi-keyframe single pass; only a
+        #     timeline longer than one Wan pass spans multiple (bridged) windows. ---
+        windows = _plan_windows(segs, total_len, chunk_frames)
+        n = len(windows)
+        log.info("[WanDirector] %d segment(s) -> %d window(s), total~%d frames, %dx%d",
+                 len(segs), n, total_len, tgt_w, tgt_h)
 
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(global_negative_prompt or ""))
         raw_tokenizer = get_raw_tokenizer(clip)
 
+        hold = max(1, int(keyframe_hold))
         stitched = None
-        prev_tail = None  # decoded tail of the previous chunk (for chaining within a segment)
-        for si, spec in enumerate(specs):
-            # Start image = this segment's keyframe (first piece) or the previous tail (chained).
-            start_image = _load_image_tensor(spec["start_raw"]) if spec["start_raw"] is not None else prev_tail
-            # End image = next segment's keyframe (FLF morph), only on a segment's last piece.
-            end_image = _load_image_tensor(spec["end_raw"]) if spec["end_raw"] is not None else None
+        prev_tail = None  # decoded tail of the previous window (latent-continuity bridge)
+        for wi, win in enumerate(windows):
+            w_len = win["length"]
 
-            cv_start = cv_end = None
-            if clip_vision is not None:
-                if start_image is not None:
-                    cv_start = clip_vision.encode_image(start_image, crop=True)
-                if end_image is not None:
-                    cv_end = clip_vision.encode_image(end_image, crop=True)
-            elif si == 0:
-                cv_start, cv_end = clip_vision_start, clip_vision_end
+            # Keyframes injected into this single pass: frame-0 anchor, interior segment
+            # images, and an end anchor bridging to the next window (cross-window continuity).
+            # Each entry: (local_frame, image_tensor, is_reference). A carried tail is a
+            # continuation (is_reference=False), so it is not "held".
+            kf = []
+            if wi == 0:
+                if win["first_raw"] is not None:
+                    kf.append((0, _load_image_tensor(win["first_raw"]), True))
+            elif prev_tail is not None:
+                kf.append((0, prev_tail, False))
+            for (lf, raw) in win["keyframes"]:
+                kf.append((int(lf), _load_image_tensor(raw), True))
+            if win["bridge_next_raw"] is not None:
+                kf.append((max(0, w_len - 1), _load_image_tensor(win["bridge_next_raw"]), True))
 
-            # One prompt per chunk (its segment's). Relay reduces to a uniform mask here.
-            full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, [spec["prompt"]])
+            # CLIP-Vision per keyframe (encode the single frame; the semantic anchor).
+            cv_outputs = []
+            for idx, (fr, img, is_ref) in enumerate(kf):
+                if clip_vision is not None and img is not None:
+                    cv_outputs.append(clip_vision.encode_image(img[:1], crop=True))
+                elif wi == 0 and idx == 0 and clip_vision_start is not None:
+                    cv_outputs.append(clip_vision_start)
+                else:
+                    cv_outputs.append(None)
+
+            # Hold reference keyframes (pins more latent frames -> stricter adherence); a
+            # carried tail stays one frame. encode_wan_keyframes does the in-latent repeat.
+            inject = [(fr, img, hold if is_ref else 1) for (fr, img, is_ref) in kf]
+
+            # True multi-segment Prompt Relay: each segment's prompt drives its own latent
+            # sub-window WITHIN this single pass (no per-clip collapse to a uniform mask).
+            prompts = [p for (p, _l) in win["segments"]]
+            seg_pix = [l for (_p, l) in win["segments"]]
+            full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, prompts)
             positive = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
 
-            positive, neg_c, latent, latent_frames = encode_wan_i2v(
-                positive, negative, vae, tgt_w, tgt_h, spec["length"], batch_size,
-                start_image=start_image, end_image=end_image,
-                clip_vision_start=cv_start, clip_vision_end=cv_end,
-                backend=i2v_backend,
+            positive, neg_c, latent, latent_frames = encode_wan_keyframes(
+                positive, negative, vae, tgt_w, tgt_h, w_len, batch_size,
+                inject, clip_vision_outputs=cv_outputs,
             )
 
             samples = latent["samples"]
             tokens_per_frame = (samples.shape[3] // patch_size[1]) * (samples.shape[4] // patch_size[2])
-            eff = distribute_segment_lengths(1, latent_frames, None)
+            eff = segment_latent_lengths(seg_pix, latent_frames) or \
+                distribute_segment_lengths(len(prompts), latent_frames, None)
             mask_fn = create_mask_fn(build_segments(token_ranges, eff, epsilon, None),
                                      tokens_per_frame, latent_frames)
             ph = model_high.clone()
@@ -316,17 +371,16 @@ class WanDirector(io.ComfyNode):
                 pl = model_low.clone()
                 apply_patches(pl, arch, mask_fn)
 
-            sampled = _moe_sample(ph, pl, int(seed) + si, int(steps), float(cfg),
+            sampled = _moe_sample(ph, pl, int(seed) + wi, int(steps), float(cfg),
                                   sampler_name, scheduler, positive, neg_c, latent, moe_boundary)
             sout = sampled["samples"]
 
-            # Stitch (drop the 1-frame seam each chunk shares with the previous frame).
+            # Stitch (drop the 1-frame seam each window shares with the previous tail).
             stitched = sout if stitched is None else torch.cat([stitched, sout[:, :, 1:]], dim=2)
-            log.info("[WanDirector] chunk %d/%d: %d frames, kf=%s flf=%s -> stitched %s",
-                     si + 1, n, spec["length"], spec["start_raw"] is not None,
-                     end_image is not None, tuple(stitched.shape))
+            log.info("[WanDirector] window %d/%d: %d frames, %d segment(s), %d keyframe(s), hold=%d -> %s",
+                     wi + 1, n, w_len, len(prompts), len(inject), hold, tuple(stitched.shape))
 
-            if si < n - 1:
+            if wi < n - 1:
                 prev_tail = _decode_tail_start(vae, sout)
 
         return io.NodeOutput({"samples": stitched}, float(frame_rate))

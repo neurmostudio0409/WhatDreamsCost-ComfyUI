@@ -174,14 +174,16 @@ director = {
     #             duration_frames, duration_seconds, timeline_data, local_prompts,
     #             segment_lengths, epsilon, steps, cfg, sampler_name, scheduler, seed,
     #             chunk_frames, moe_boundary
-    #   optional: i2v_backend, frame_rate, display_mode, divisible_by, max_side, guide_strength
+    #   optional: i2v_backend, frame_rate, display_mode, divisible_by, max_side,
+    #             guide_strength, keyframe_hold
     # width/height/length = 0 -> auto (length follows the timeline). max_side caps the
-    # longest side (~480p default) for speed. Director samples internally (MoE
-    # high->low) and chains chunks, so no external KSampler.
+    # longest side (~480p default) for speed. keyframe_hold pins each reference image
+    # across N frames for stricter adherence (5 ≈ 2 latent frames). Director samples
+    # internally (MoE high->low) and chains chunks, so no external KSampler.
     "widgets_values": [
         "", "", 0, 0, 0, 1, 120, 5.0, "", "", "", 0.001,
         STEPS, CFG, SAMPLER, SCHED, 0, CHUNK_FRAMES, MOE_BOUNDARY,
-        "native", 24, "seconds", 16, 832, "",
+        "native", 16, "seconds", 16, 832, "", 5,
     ],
 }
 out_nodes.append(director)
