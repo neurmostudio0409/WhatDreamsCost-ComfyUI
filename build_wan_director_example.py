@@ -184,7 +184,6 @@ director = {
         "", "", 0, 0, 0, 1, 120, 5.0, "", "", "", 0.001,
         STEPS, CFG, SAMPLER, SCHED, 0, CHUNK_FRAMES, MOE_BOUNDARY,
         "native", 16, "seconds", 16, 832, "", 5, False, 0.0, False,
-        "SINGLE_PERSON", 0.6, 1.0, 0.16, 1.0, 1.0,
     ],
 }
 out_nodes.append(director)
