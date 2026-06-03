@@ -200,12 +200,22 @@ def _moe_sample(model_high, model_low, seed, steps, cfg, sampler_name, scheduler
                            force_full_denoise=True)[0]
 
 
+def _decode_tail_start(vae, samples):
+    """Decode the last latent frame of a clip to a single image tensor [1, H, W, C], to
+    feed as the NEXT clip's start_image — the proven decoded-frame chaining the reference
+    FLF workflows use (standard I2V conditioning genuinely pins frame 0 = no hard cut)."""
+    decoded = vae.decode(samples[:, :, -1:].contiguous())
+    if decoded.dim() == 5:  # [B, T, H, W, C] -> [T, H, W, C]
+        decoded = decoded[0]
+    return decoded[-1:]
+
+
 class WanDirector(io.ComfyNode):
     """Wan timeline editor with segment-aligned first-last-frame (FLF) chaining.
-    Drop an image on each timeline segment; each segment becomes an FLF clip that morphs from
-    its keyframe to the next segment's keyframe, chained in LATENT space (the previous clip's
-    last latent frame seeds the next) — so the segments connect (seg1's tail = seg2's head)
-    without colour drift. Outputs one LATENT — feed to VAEDecode → VHS_VideoCombine."""
+    Drop an image on each timeline segment; each segment becomes an FLF clip that morphs toward
+    the NEXT segment's keyframe, and each clip starts from the previous clip's DECODED last
+    frame (standard I2V conditioning) so the boundary frame matches = segments connect with no
+    hard cut. Outputs one LATENT — feed to VAEDecode → VHS_VideoCombine."""
 
     @classmethod
     def define_schema(cls):
@@ -215,9 +225,9 @@ class WanDirector(io.ComfyNode):
             category="WhatDreamsCost",
             description=(
                 "Wan2.2/2.1 timeline → long video. Each segment is a first-last-frame (FLF) clip that "
-                "morphs from its keyframe to the NEXT segment's keyframe, chained in latent space so "
-                "segments connect seamlessly (seg1's tail = seg2's head) without colour drift. Samples "
-                "internally (MoE high→low) and outputs one LATENT — feed to VAEDecode → VHS_VideoCombine."
+                "morphs toward the NEXT segment's keyframe; each clip starts from the previous clip's "
+                "decoded last frame so the boundary matches (no hard cut). Samples internally "
+                "(MoE high→low) and outputs one LATENT — feed to VAEDecode → VHS_VideoCombine."
             ),
             inputs=[
                 io.Model.Input("model_high", tooltip="Wan diffusion model. For MoE 14B this is the high-noise model."),
@@ -382,37 +392,39 @@ class WanDirector(io.ComfyNode):
         hold = max(1, int(keyframe_hold))
 
         stitched = None
-        prev_latent_tail = None   # previous clip's last LATENT frame (continuity, no VAE round-trip)
-        last_cv = clip_vision_start  # most recent keyframe's CLIP-Vision (carried into continuation)
+        prev_tail = None   # previous clip's last DECODED frame [1,H,W,C] — the I2V start of the next clip
         for ci, cl in enumerate(clips):
             plen = cl["length"]
 
-            # Continuity is carried in LATENT space (prev_latent_tail) — no decode->re-encode
-            # colour drift. Clip 0 starts from its keyframe image; the morph TARGET is the next
-            # keyframe (FLF) on a segment's last piece.
-            start_image = _load_image_tensor(cl["start_raw"]) if (ci == 0 and cl["start_raw"] is not None) else None
+            # Each clip starts from a REAL image: its keyframe (clip 0 / a segment's first piece)
+            # or the previous clip's decoded last frame (continuation). Standard I2V conditioning
+            # pins frame 0 to that image, so the boundary matches = no hard cut. The morph TARGET
+            # is the next keyframe (FLF) on a segment's last piece.
+            # Only the VERY FIRST clip starts from its clean keyframe image; every later clip
+            # continues from the previous clip's decoded tail (the keyframe images for later
+            # segments are used as FLF END targets, not restarts — restarting from a clean
+            # keyframe with a fresh seed is exactly what caused the hard cut at boundaries).
+            start_is_kf = (ci == 0 and cl["start_raw"] is not None)
+            if start_is_kf:
+                start_image = _load_image_tensor(cl["start_raw"])
+                start_hold = hold
+                start_str = float(cl["start_raw"].get("guideStrength", 1.0))
+            else:
+                start_image = prev_tail          # decoded tail of the previous clip (continuity)
+                start_hold = 1                   # just anchor frame 0 (no freeze)
+                start_str = 1.0
             end_image = _load_image_tensor(cl["end_raw"]) if cl["end_raw"] is not None else None
-
-            # Per-keyframe guide strength (0..1 from the timeline slider; 1 = fully enforced).
-            start_str = float(cl["start_raw"].get("guideStrength", 1.0)) if cl["start_raw"] else 1.0
             end_str = float(cl["end_raw"].get("guideStrength", 1.0)) if cl["end_raw"] else 1.0
 
             inject, cv_outputs = [], []
             if start_image is not None:
-                inject.append((0, start_image, hold, start_str))
-                cv = clip_vision.encode_image(start_image[:1], crop=True) if clip_vision is not None else clip_vision_start
-                if cv is not None:
-                    last_cv = cv
+                inject.append((0, start_image, start_hold, start_str))
+                cv = clip_vision.encode_image(start_image[:1], crop=True) if clip_vision is not None else (clip_vision_start if ci == 0 else None)
                 cv_outputs.append(cv)
             if end_image is not None:
                 inject.append((max(0, plen - 1), end_image, hold, end_str))
                 cv = clip_vision.encode_image(end_image[:1], crop=True) if clip_vision is not None else None
-                if cv is not None:
-                    last_cv = cv
                 cv_outputs.append(cv)
-            # No image keyframe this clip (pure continuation): keep the last reference anchor.
-            if not cv_outputs and last_cv is not None:
-                cv_outputs = [last_cv]
 
             full_prompt, _tr = map_token_indices(raw_tokenizer, global_prompt, [cl["prompt"]])
             positive = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
@@ -420,19 +432,17 @@ class WanDirector(io.ComfyNode):
             positive, neg_c, latent, _lf = encode_wan_keyframes(
                 positive, negative, vae, tgt_w, tgt_h, plen, batch_size,
                 inject, clip_vision_outputs=cv_outputs,
-                latent_context=(prev_latent_tail if ci > 0 else None),
             )
 
             sampled = _moe_sample(model_high, model_low, int(seed) + ci, int(steps), float(cfg),
                                   sampler_name, scheduler, positive, neg_c, latent, moe_boundary)
             sout = sampled["samples"]
 
-            # Stitch latents (drop the 1-frame overlap each clip shares with the previous tail);
-            # decode happens once downstream in VAEDecode.
+            # Stitch (drop the 1-frame overlap each clip shares with the previous clip's tail).
             stitched = sout if stitched is None else torch.cat([stitched, sout[:, :, 1:]], dim=2)
             if ci < n - 1:
-                prev_latent_tail = sout[:, :, -1:]
-            log.info("[WanDirector] clip %d/%d: %d frames, flf=%s prompt=%r -> stitched %s",
-                     ci + 1, n, plen, end_image is not None, (cl["prompt"] or "")[:24], tuple(stitched.shape))
+                prev_tail = _decode_tail_start(vae, sout)   # decoded -> next clip's start_image
+            log.info("[WanDirector] clip %d/%d: %d frames, kf_start=%s flf=%s prompt=%r -> stitched %s",
+                     ci + 1, n, plen, start_is_kf, end_image is not None, (cl["prompt"] or "")[:24], tuple(stitched.shape))
 
         return io.NodeOutput({"samples": stitched}, float(frame_rate))
