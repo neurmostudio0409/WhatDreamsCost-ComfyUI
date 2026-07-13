@@ -16,7 +16,7 @@ class MultiImageLoader:
                 "width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
                 "height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
                 "interpolation": (["lanczos", "nearest", "bilinear", "bicubic", "area", "nearest-exact"],),
-                "resize_method": (["keep proportion", "stretch", "pad", "crop"],),
+                "resize_method": (["keep proportion", "stretch", "pad", "pad green", "crop"],),
                 "multiple_of": ("INT", {"default": 32, "min": 0, "max": 512, "step": 1}),
                 "img_compression": ("INT", {"default": 18, "min": 0, "max": 100, "step": 1}),
             },
@@ -53,7 +53,7 @@ class MultiImageLoader:
             new_width = round(ow * ratio)
             new_height = round(oh * ratio)
 
-            if resize_method == 'pad':
+            if resize_method == 'pad' or resize_method == 'pad green':
                 pad_left = (width - new_width) // 2
                 pad_right = width - new_width - pad_left
                 pad_top = (height - new_height) // 2
@@ -96,9 +96,26 @@ class MultiImageLoader:
         else:
             outputs = F.interpolate(outputs, size=(height, width), mode=interpolation)
 
-        if resize_method == 'pad':
+        if resize_method == 'pad' or resize_method == 'pad green':
             if pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0:
                 outputs = F.pad(outputs, (pad_left, pad_right, pad_top, pad_bottom), value=0)
+                if resize_method == 'pad green':
+                    if pad_top > 0:
+                        outputs[:, 0, :pad_top, :] = 102 / 255.0
+                        outputs[:, 1, :pad_top, :] = 1.0
+                        outputs[:, 2, :pad_top, :] = 0.0
+                    if pad_bottom > 0:
+                        outputs[:, 0, -pad_bottom:, :] = 102 / 255.0
+                        outputs[:, 1, -pad_bottom:, :] = 1.0
+                        outputs[:, 2, -pad_bottom:, :] = 0.0
+                    if pad_left > 0:
+                        outputs[:, 0, :, :pad_left] = 102 / 255.0
+                        outputs[:, 1, :, :pad_left] = 1.0
+                        outputs[:, 2, :, :pad_left] = 0.0
+                    if pad_right > 0:
+                        outputs[:, 0, :, -pad_right:] = 102 / 255.0
+                        outputs[:, 1, :, -pad_right:] = 1.0
+                        outputs[:, 2, :, -pad_right:] = 0.0
 
         outputs = outputs.permute(0, 2, 3, 1)
 

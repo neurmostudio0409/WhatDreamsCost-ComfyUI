@@ -1436,6 +1436,7 @@ class TimelineEditor {
   async _ensureThumbnails(seg) {
     if (seg.thumbnails) return;
     if (seg._extractingThumbs) return;
+    if (seg.isStaticImage) return;
 
     const fileKey = seg.imageFile || seg.videoFile || seg._blobUrl;
     if (!fileKey) return;
@@ -1502,7 +1503,7 @@ class TimelineEditor {
 
         const duration = bgVid.duration;
         const isLargeFile = seg.fileSize > 500 * 1024 * 1024;
-        const numFrames = isLargeFile ? 10 : Math.max(5, Math.min(25, Math.ceil(duration * 1.0)));
+        const numFrames = isLargeFile ? 15 : Math.max(10, Math.min(80, Math.ceil(duration * 5.0)));
         const canvas = document.createElement('canvas');
         let w = bgVid.videoWidth, h = bgVid.videoHeight;
         if (w === 0 || h === 0) return thumbs;
@@ -1674,6 +1675,7 @@ class TimelineEditor {
 
   _ensureVideoEl(seg) {
     if (!seg) return;
+    if (seg.isStaticImage) return;
 
     if (seg.videoEl) {
       if (seg.videoEl.duration && !seg.videoDurationFrames) {
@@ -1957,6 +1959,7 @@ class TimelineEditor {
 
 
   async _preloadMotionAudioSegment(seg) {
+    if (seg.isStaticImage) return;
     if (seg._audioBuffer || seg._decodingAudio) return;
     if (!seg.videoFile && !seg._blobUrl) return;
 
@@ -2038,7 +2041,7 @@ class TimelineEditor {
           seg.imgObj.onload = () => { if (!this._isDragging) this.render(); };
           seg.imgObj.src = seg.imageB64;
         }
-        if (seg.type === "motion_video") {
+        if (seg.type === "motion_video" && !seg.isStaticImage) {
           this._ensureVideoEl(seg);
           this._ensureThumbnails(seg);
           if (isOverrideAudio) {
@@ -2210,7 +2213,7 @@ class TimelineEditor {
 
     this.motionFileInput = document.createElement("input");
     this.motionFileInput.type = "file";
-    this.motionFileInput.accept = "video/*";
+    this.motionFileInput.accept = "video/*,image/*";
     this.motionFileInput.multiple = true;
     this.motionFileInput.style.display = "none";
     this.motionFileInput.addEventListener("change", (e) => this.handleMotionUpload(e.target.files));
@@ -3062,9 +3065,14 @@ class TimelineEditor {
         const audioFiles = [];
         const videoFiles = [];
         for (let file of e.dataTransfer.files) {
-          if (file.type.startsWith("video/")) videoFiles.push(file);
-          else if (file.type.startsWith("audio/")) audioFiles.push(file);
-          else if (file.type.startsWith("image/")) imageFiles.push(file);
+          const nameLower = file.name.toLowerCase();
+          const isVideo = file.type.startsWith("video/") || nameLower.match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/);
+          const isAudio = file.type.startsWith("audio/") || nameLower.match(/\.(mp3|wav|ogg|flac|m4a|aac)$/);
+          const isImage = file.type.startsWith("image/") || nameLower.match(/\.(jpg|jpeg|png|webp|gif|bmp)$/);
+          
+          if (isVideo) videoFiles.push(file);
+          else if (isAudio) audioFiles.push(file);
+          else if (isImage) imageFiles.push(file);
         }
 
         // Let implicit intent handle mixing drops: use the track we hovered over
@@ -3075,6 +3083,8 @@ class TimelineEditor {
           } else {
             this.handleVideoUpload(videoFiles, targetFrameStart);
           }
+        } else if (imageFiles.length > 0 && targetTrack === "motion") {
+          this.handleMotionUpload(imageFiles, targetFrameStart);
         } else if (audioFiles.length > 0 && (targetTrack === "audio" || imageFiles.length === 0)) {
           this.handleAudioUpload(audioFiles, targetFrameStart);
         } else if (imageFiles.length > 0) {
@@ -3618,7 +3628,7 @@ class TimelineEditor {
     inpaintToggleBtn.disabled = !this.audioTrackEnabled;
     inpaintToggleBtn.style.opacity = this.audioTrackEnabled ? "1.0" : "0.3";
 
-    this.motionTrackLabel = createTrackLabel("IC-LoRA Video", "#1e1e1e", "motion", this.motionTrackEnabled, () => {
+    this.motionTrackLabel = createTrackLabel("IC-LoRA Input", "#1e1e1e", "motion", this.motionTrackEnabled, () => {
       this.motionTrackEnabled = !this.motionTrackEnabled;
       updateTrackIcon(this.motionTrackLabel._eyeBtn, "motion", this.motionTrackEnabled);
 
@@ -3905,7 +3915,8 @@ class TimelineEditor {
     const newLength = explicitLength !== null ? explicitLength : frameRate * 1; // Default to 1 second long
 
     for (let file of files) {
-      if (!file.type.startsWith("image/")) continue;
+      const nameLower = file.name.toLowerCase();
+      if (!(file.type.startsWith("image/") || nameLower.match(/\.(jpg|jpeg|png|webp|gif|bmp)$/))) continue;
 
       await new Promise(async (resolve) => {
         try {
@@ -4070,7 +4081,9 @@ class TimelineEditor {
 
     if (this.retakeMode) {
       const file = files[0];
-      if (!file || !file.type.startsWith("video/")) return;
+      if (!file) return;
+      const nameLower = file.name.toLowerCase();
+      if (!(file.type.startsWith("video/") || nameLower.match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/))) return;
 
       // Clean up previous retake video if one exists
       if (this.timeline.retakeVideo) {
@@ -4139,13 +4152,22 @@ class TimelineEditor {
           this.render();
           resolve();
         };
+
+        vid.onerror = (err) => {
+          console.error("Retake video load error:", err);
+          URL.revokeObjectURL(blobUrl);
+          alert("Video Load Error:\n\nThis video format or codec is not supported by your web browser (e.g., MKV or ProRes).\n\nPlease convert the video to a standard MP4 (H.264 / AAC) to use it on the timeline.");
+          resolve();
+        };
+
         vid.src = blobUrl;
       });
       return;
     }
 
     for (let file of files) {
-      if (!file.type.startsWith("video/")) continue;
+      const nameLower = file.name.toLowerCase();
+      if (!(file.type.startsWith("video/") || nameLower.match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/))) continue;
 
       await new Promise(async (resolve) => {
         try {
@@ -4367,6 +4389,7 @@ class TimelineEditor {
           vid.onerror = (e) => {
             console.error("Video load error", e);
             URL.revokeObjectURL(blobUrl);
+            alert("Video Load Error:\n\nThis video format or codec is not supported by your web browser (e.g., MKV or ProRes).\n\nPlease convert the video to a standard MP4 (H.264 / AAC) to use it on the timeline.");
             resolve();
           };
 
@@ -4430,12 +4453,91 @@ class TimelineEditor {
     const frameRate = this.getFrameRate();
 
     for (let file of files) {
-      if (!(file.type.startsWith("video/") || file.name.toLowerCase().match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/))) continue;
+      const nameLower = file.name.toLowerCase();
+      const isVideo = file.type.startsWith("video/") || nameLower.match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/);
+      const isImage = file.type.startsWith("image/") || nameLower.match(/\.(jpg|jpeg|png|webp|gif|bmp)$/);
+      if (!isVideo && !isImage) continue;
 
       await new Promise(async (resolve) => {
         try {
           // Load from local blob immediately — no waiting for server upload
           const blobUrl = URL.createObjectURL(file);
+
+          if (isImage) {
+            const img = new Image();
+            img.crossOrigin = "Anonymous";
+            img.onload = () => {
+              const currentDuration = this.getVisualDurationFrames();
+              const newLength = Math.max(1, currentDuration);
+              const newStart = targetFrameStart !== null ? targetFrameStart : 0;
+
+              // Generate imageB64 for workflow serialization
+              const canvas = document.createElement('canvas');
+              canvas.width = Math.min(img.width, 512);
+              canvas.height = Math.round((img.height / img.width) * canvas.width);
+              const ctx = canvas.getContext('2d');
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+              const imageB64 = canvas.toDataURL('image/jpeg', 0.85);
+
+              const seg = {
+                id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+                type: "motion_video",
+                isStaticImage: true,
+                start: newStart,
+                length: newLength,
+                trimStart: 0,
+                videoDurationFrames: newLength,
+                videoFile: "", // filled in after upload
+                fileName: file.name,
+                videoStrength: 1.0,
+                videoAttentionStrength: 0.65,
+                resampleMode: "nearest",
+                imgObj: img,
+                imageB64: imageB64,
+                _uploading: true,
+                _blobUrl: blobUrl,
+                fileSize: file.size
+              };
+
+              this.timeline.motionSegments.push(seg);
+              this.timeline.motionSegments.sort((a, b) => a.start - b.start);
+
+              if (!this.retakeMode) {
+                this.growTimelineIfNeeded(seg.start + seg.length);
+              }
+
+              this.selectionType = "motion";
+              this.selectedIndex = this.timeline.motionSegments.findIndex(s => s.id === seg.id);
+              this.updateUIFromSelection();
+              this.commitChanges(true);
+              this.render();
+              resolve();
+
+              // Upload in background
+              this._uploadVideoFile(file).then(filePath => {
+                const currentSeg = this.timeline.motionSegments.find(s => s.id === seg.id);
+                if (currentSeg) {
+                  currentSeg.videoFile = filePath;
+                  currentSeg._uploading = false;
+                }
+                this.commitChanges(true);
+                this.render();
+              }).catch(e => {
+                console.error("Failed to upload motion image:", e);
+                const currentSeg = this.timeline.motionSegments.find(s => s.id === seg.id);
+                if (currentSeg) currentSeg._uploading = false;
+                this.render();
+              });
+            };
+            img.onerror = (e) => {
+              console.error("Image load error", e);
+              URL.revokeObjectURL(blobUrl);
+              alert("Image Load Error:\n\nFailed to load the reference sheet image preview.");
+              resolve();
+            };
+            img.src = blobUrl;
+            return;
+          }
 
           const vid = document.createElement('video');
           vid.crossOrigin = "Anonymous";
@@ -4580,7 +4682,8 @@ class TimelineEditor {
     const durationFrames = this.getDurationFrames();
 
     for (let file of files) {
-      if (!file.type.startsWith("audio/")) continue;
+      const nameLower = file.name.toLowerCase();
+      if (!(file.type.startsWith("audio/") || nameLower.match(/\.(mp3|wav|ogg|flac|m4a|aac)$/))) continue;
 
       await new Promise(async (resolve) => {
         try {
@@ -6551,7 +6654,8 @@ class TimelineEditor {
             this.ctx.font = "bold 10px sans-serif";
             this.ctx.textAlign = "center";
             this.ctx.textBaseline = "middle";
-            this.ctx.fillText("IC-LoRA Video", startX + 37, trackY + 9);
+            const label = seg.isStaticImage ? "IC-LoRA Image" : "IC-LoRA Video";
+            this.ctx.fillText(label, startX + 37, trackY + 9);
             this.ctx.restore();
 
             // Uploading / Loading indicator badge (bottom-left corner)
@@ -7276,9 +7380,7 @@ class TimelineEditor {
           const copiedTrack = this._copiedSegmentTrack || window._ltxCopiedSegmentType;
           const isCompatible = hasCopied && this.getCanonicalTrack(copiedTrack) === currentTrack;
 
-          if (currentTrack === "motion" && !isCompatible) {
-            this.promptAddMotionInGap(gap.frameStart, gap.frameEnd);
-          } else if (currentTrack === "audio" && !isCompatible) {
+          if (currentTrack === "audio" && !isCompatible) {
             this.promptAddAudioInGap(gap.frameStart, gap.frameEnd);
           } else {
             this.showGapMenu(e.clientX, e.clientY, gap);
@@ -8055,7 +8157,7 @@ class TimelineEditor {
           }
         }
 
-        if (this.selectionType === "audio" || t[targetIdx].type === "video" || t[targetIdx].type === "motion_video") {
+        if ((this.selectionType === "audio" || t[targetIdx].type === "video" || t[targetIdx].type === "motion_video") && !t[targetIdx].isStaticImage) {
           const origDur = t[targetIdx].audioDurationFrames || t[targetIdx].videoDurationFrames || t[targetIdx].length;
           maxPossibleLength = Math.min(maxPossibleLength, origDur - (t[targetIdx].trimStart || 0));
         }
@@ -8124,7 +8226,7 @@ class TimelineEditor {
           }
         }
 
-        if (this.selectionType === "audio" || t[targetIdx].type === "video" || t[targetIdx].type === "motion_video") {
+        if ((this.selectionType === "audio" || t[targetIdx].type === "video" || t[targetIdx].type === "motion_video") && !t[targetIdx].isStaticImage) {
           minPossibleStart = Math.max(minPossibleStart, t[targetIdx].start - (t[targetIdx].trimStart || 0));
         }
 
@@ -8134,7 +8236,7 @@ class TimelineEditor {
         let diff = newStart - t[targetIdx].start;
         t[targetIdx].start = newStart;
         t[targetIdx].length -= diff;
-        if (this.selectionType === "audio" || t[targetIdx].type === "video" || t[targetIdx].type === "motion_video") {
+        if ((this.selectionType === "audio" || t[targetIdx].type === "video" || t[targetIdx].type === "motion_video") && !t[targetIdx].isStaticImage) {
           t[targetIdx].trimStart += diff;
         }
 
@@ -9262,7 +9364,7 @@ class TimelineEditor {
     menu.style.left = `${clientX + 6}px`;
     menu.style.top = `${clientY - 10}px`;
 
-    const isImage = trackType === "image" && seg.imageB64;
+    const isImage = (trackType === "image" || (trackType === "motion" && seg.isStaticImage)) && seg.imageB64;
 
     const makeDivider = () => {
       const d = document.createElement("div");
@@ -9408,6 +9510,15 @@ class TimelineEditor {
     let replaceWithFileBtn = null;
 
     if (isImage) {
+      let fullResUrl = seg.imageB64;
+      const fileKey = seg.imageFile || seg.videoFile;
+      if (fileKey) {
+        const parts = fileKey.split(/[/\\]/);
+        const filename = parts.pop();
+        const subfolder = parts.join('/');
+        fullResUrl = api.apiURL(`/view?filename=${encodeURIComponent(filename)}&type=input&subfolder=${encodeURIComponent(subfolder)}`);
+      }
+
       copyImgBtn = document.createElement("button");
       copyImgBtn.className = "pr-gap-menu-btn";
       copyImgBtn.innerHTML = `Copy Image`;
@@ -9415,7 +9526,7 @@ class TimelineEditor {
         try {
           const img = new Image();
           img.crossOrigin = "Anonymous";
-          img.src = seg.imageB64;
+          img.src = fullResUrl;
           await new Promise((resolve, reject) => {
             img.onload = resolve;
             img.onerror = reject;
@@ -9437,7 +9548,7 @@ class TimelineEditor {
       saveImgBtn.innerHTML = `Save Image`;
       saveImgBtn.onclick = () => {
         const a = document.createElement("a");
-        a.href = seg.imageB64;
+        a.href = fullResUrl;
         a.download = "timeline_image.jpg";
         a.click();
         this.dismissContextMenu();
@@ -9449,7 +9560,7 @@ class TimelineEditor {
       openImgBtn.onclick = () => {
         const win = window.open();
         if (win) {
-          win.document.write(`<body style="margin:0;display:flex;justify-content:center;align-items:center;background:#0e0e0e;height:100vh;"><img style="max-width:100%;max-height:100%;" src="${seg.imageB64}" /></body>`);
+          win.document.write(`<body style="margin:0;display:flex;justify-content:center;align-items:center;background:#0e0e0e;height:100vh;"><img style="max-width:100%;max-height:100%;" src="${fullResUrl}" /></body>`);
           win.document.close();
         }
         this.dismissContextMenu();
@@ -9482,11 +9593,15 @@ class TimelineEditor {
                 const img = new Image();
                 img.onload = () => {
                   seg.imageFile = imageFile;
+                  if (trackType === "motion") {
+                    seg.videoFile = imageFile;
+                    seg.fileName = file.name;
+                  }
                   seg.imageB64 = imgUrl;
                   seg.imgObj = img;
                   this.commitChanges();
                   this.render();
-                  if (this.selectedIndex === this.timeline.segments.findIndex(s => s.id === seg.id)) {
+                  if (this.selectedIndex === this.getSegmentArray(trackType).findIndex(s => s.id === seg.id)) {
                     this.updateUIFromSelection();
                   }
                 };
@@ -9527,11 +9642,15 @@ class TimelineEditor {
               const img = new Image();
               img.onload = () => {
                 seg.imageFile = imageFile;
+                if (trackType === "motion") {
+                  seg.videoFile = imageFile;
+                  seg.fileName = file.name;
+                }
                 seg.imageB64 = imgUrl;
                 seg.imgObj = img;
                 this.commitChanges();
                 this.render();
-                if (this.selectedIndex === this.timeline.segments.findIndex(s => s.id === seg.id)) {
+                if (this.selectedIndex === this.getSegmentArray(trackType).findIndex(s => s.id === seg.id)) {
                   this.updateUIFromSelection();
                 }
               };
@@ -9777,9 +9896,53 @@ class TimelineEditor {
         fi.click();
       };
 
-      menu.appendChild(vidBtn);
       menu.appendChild(pasteImageBtn);
+      menu.appendChild(textBtn);
+      menu.appendChild(imgBtn);
+      menu.appendChild(vidBtn);
     } else if (currentTrack === "motion") {
+      const pasteImageBtn = document.createElement("button");
+      pasteImageBtn.className = "pr-gap-menu-btn";
+      pasteImageBtn.innerHTML = `${ICONS.upload} Paste Image`;
+      this._checkClipboardForImage(pasteImageBtn);
+      pasteImageBtn.onclick = async () => {
+        this.dismissContextMenu();
+        try {
+          const items = await navigator.clipboard.read();
+          for (const item of items) {
+            const imageTypes = item.types.filter(type => type.startsWith("image/"));
+            if (imageTypes.length > 0) {
+              const blob = await item.getType(imageTypes[0]);
+              const file = new File([blob], "clipboard.png", { type: blob.type });
+              const startFrame = Math.round(gap.clickedFrame !== undefined ? gap.clickedFrame : gap.frameStart);
+              await this.handleMotionUpload([file], startFrame);
+              break;
+            }
+          }
+        } catch (err) {
+          console.error("Failed to paste image from clipboard", err);
+        }
+      };
+      menu.appendChild(pasteImageBtn);
+
+      const imgBtn = document.createElement("button");
+      imgBtn.className = "pr-gap-menu-btn";
+      imgBtn.innerHTML = `${ICONS.upload} Image Segment`;
+      imgBtn.onclick = () => {
+        this.dismissContextMenu();
+        const fi = document.createElement("input");
+        fi.type = "file";
+        fi.accept = "image/*";
+        fi.addEventListener("change", (ev) => {
+          if (ev.target.files?.[0]) {
+            const startFrame = Math.round(gap.clickedFrame !== undefined ? gap.clickedFrame : gap.frameStart);
+            this.handleMotionUpload([ev.target.files[0]], startFrame);
+          }
+        });
+        fi.click();
+      };
+      menu.appendChild(imgBtn);
+
       const vidBtn = document.createElement("button");
       vidBtn.className = "pr-gap-menu-btn";
       vidBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg> Video Segment`;
@@ -9825,6 +9988,29 @@ class TimelineEditor {
     menu.style.top = `${clientY - 10}px`;
 
     const currentTrack = gap.track;
+
+    const hasCopied = this._copiedSegment || window._ltxCopiedSegment;
+    const copiedTrack = this._copiedSegmentTrack || window._ltxCopiedSegmentType;
+    const copiedSegData = this._copiedSegment || (window._ltxCopiedSegment ? window._ltxCopiedSegment.main : null);
+    const copiedSibData = window._ltxCopiedSegment ? window._ltxCopiedSegment.sibling : null;
+
+    const canPaste = hasCopied && this.getCanonicalTrack(copiedTrack) === this.getCanonicalTrack(currentTrack) && copiedSegData;
+    const pasteBtn = document.createElement("button");
+    pasteBtn.className = "pr-gap-menu-btn";
+    pasteBtn.innerHTML = `Paste Segment`;
+    if (!canPaste) {
+      pasteBtn.disabled = true;
+      pasteBtn.style.opacity = "0.4";
+      pasteBtn.style.cursor = "not-allowed";
+      pasteBtn.title = "No matching segment copied to clipboard";
+    } else {
+      pasteBtn.onclick = () => {
+        const startFrame = Math.round(gap.frameStart);
+        this.pasteSegmentAtFrame(copiedSegData, this.getCanonicalTrack(copiedTrack), copiedSibData, startFrame);
+        this.dismissGapMenu();
+      };
+    }
+    menu.appendChild(pasteBtn);
 
     if (currentTrack === "image") {
       const textBtn = document.createElement("button");
@@ -9889,11 +10075,51 @@ class TimelineEditor {
         fi.click();
       });
 
+      menu.appendChild(pasteImageBtn);
       menu.appendChild(textBtn);
       menu.appendChild(imgBtn);
       menu.appendChild(vidBtn);
-      menu.appendChild(pasteImageBtn);
     } else if (currentTrack === "motion") {
+      const pasteImageBtn = document.createElement("button");
+      pasteImageBtn.className = "pr-gap-menu-btn";
+      pasteImageBtn.innerHTML = `${ICONS.upload} Paste Image`;
+      this._checkClipboardForImage(pasteImageBtn);
+      pasteImageBtn.addEventListener("click", async () => {
+        this.dismissGapMenu();
+        try {
+          const items = await navigator.clipboard.read();
+          for (const item of items) {
+            const imageTypes = item.types.filter(type => type.startsWith("image/"));
+            if (imageTypes.length > 0) {
+              const blob = await item.getType(imageTypes[0]);
+              const file = new File([blob], "clipboard.png", { type: blob.type });
+              await this.handleMotionUpload([file], gap.frameStart);
+              break;
+            }
+          }
+        } catch (err) {
+          console.error("Failed to paste image from clipboard", err);
+        }
+      });
+      menu.appendChild(pasteImageBtn);
+
+      const imgBtn = document.createElement("button");
+      imgBtn.className = "pr-gap-menu-btn";
+      imgBtn.innerHTML = `${ICONS.upload} Image Segment`;
+      imgBtn.addEventListener("click", () => {
+        this.dismissGapMenu();
+        const fi = document.createElement("input");
+        fi.type = "file";
+        fi.accept = "image/*";
+        fi.addEventListener("change", (ev) => {
+          if (ev.target.files?.[0]) {
+            this.handleMotionUpload([ev.target.files[0]], gap.frameStart);
+          }
+        });
+        fi.click();
+      });
+      menu.appendChild(imgBtn);
+
       const vidBtn = document.createElement("button");
       vidBtn.className = "pr-gap-menu-btn";
       vidBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg> Video Segment`;
@@ -9912,29 +10138,6 @@ class TimelineEditor {
       });
       menu.appendChild(audBtn);
     }
-
-    const hasCopied = this._copiedSegment || window._ltxCopiedSegment;
-    const copiedTrack = this._copiedSegmentTrack || window._ltxCopiedSegmentType;
-    const copiedSegData = this._copiedSegment || (window._ltxCopiedSegment ? window._ltxCopiedSegment.main : null);
-    const copiedSibData = window._ltxCopiedSegment ? window._ltxCopiedSegment.sibling : null;
-
-    const canPaste = hasCopied && this.getCanonicalTrack(copiedTrack) === this.getCanonicalTrack(currentTrack) && copiedSegData;
-    const pasteBtn = document.createElement("button");
-    pasteBtn.className = "pr-gap-menu-btn";
-    pasteBtn.innerHTML = `Paste Segment`;
-    if (!canPaste) {
-      pasteBtn.disabled = true;
-      pasteBtn.style.opacity = "0.4";
-      pasteBtn.style.cursor = "not-allowed";
-      pasteBtn.title = "No matching segment copied to clipboard";
-    } else {
-      pasteBtn.onclick = () => {
-        const startFrame = Math.round(gap.frameStart);
-        this.pasteSegmentAtFrame(copiedSegData, this.getCanonicalTrack(copiedTrack), copiedSibData, startFrame);
-        this.dismissGapMenu();
-      };
-    }
-    menu.appendChild(pasteBtn);
 
     document.body.appendChild(menu);
     this._gapMenu = menu;

@@ -51,6 +51,10 @@ class LoadAudioUI:
             input_dir = folder_paths.get_input_directory()
             if os.path.exists(input_dir):
                 all_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+                wdc_dir = os.path.join(input_dir, "whatdreamscost")
+                if os.path.exists(wdc_dir):
+                    wdc_files = [f"whatdreamscost/{f}" for f in os.listdir(wdc_dir) if os.path.isfile(os.path.join(wdc_dir, f))]
+                    all_files.extend(wdc_files)
                 try:
                     files = sorted(folder_paths.filter_files_content_types(all_files, ["audio", "video"]))
                 except:
@@ -72,8 +76,8 @@ class LoadAudioUI:
         }
 
     CATEGORY = "WhatDreamsCost"
-    RETURN_TYPES = ("AUDIO", "FLOAT")
-    RETURN_NAMES = ("audio", "duration")
+    RETURN_TYPES = ("AUDIO", "FLOAT", "STRING")
+    RETURN_NAMES = ("audio", "duration", "filename")
     FUNCTION = "load_audio"
 
     @classmethod
@@ -138,4 +142,5 @@ class LoadAudioUI:
         # Calculate the final trimmed duration in seconds as a float
         final_duration = float(trimmed_waveform.shape[1] / sample_rate)
         
-        return (audio_output, final_duration)
+        out_filename = "" if audio == "none" or not audio_path or not os.path.exists(audio_path) else os.path.basename(audio)
+        return (audio_output, final_duration, out_filename)

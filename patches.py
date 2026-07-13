@@ -1,9 +1,20 @@
 import logging
 import types
+import sys
 
 import comfy.ldm.modules.attention
 
 log = logging.getLogger(__name__)
+
+
+def get_current_node_id() -> str:
+    """Walk up the CPython stack frames to find ComfyUI's unique_id of the currently executing node."""
+    frame = sys._getframe()
+    while frame:
+        if "unique_id" in frame.f_locals:
+            return str(frame.f_locals["unique_id"])
+        frame = frame.f_back
+    return "default_relay"
 
 
 def _masked_attention(q, k, v, heads, mask, transformer_options={}, **kwargs):
@@ -86,9 +97,10 @@ def _make_ltx_mask_wrapper(underlying, mask_fn, attr):
     """
     def wrapped(_self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}):
         debug_log(f"wrapped called: x.shape={list(x.shape)} context.shape={list(context.shape) if context is not None else None} mask_is_none={mask is None}")
-        if context is not None:
+        active_mask_fn = transformer_options.get("promptrelay_mask_fn", mask_fn)
+        if active_mask_fn is not None and context is not None:
             opts = {**transformer_options, "promptrelay_attn_type": attr}
-            pr_mask = mask_fn(x.shape[1], context.shape[1], x.dtype, x.device, opts)
+            pr_mask = active_mask_fn(x.shape[1], context.shape[1], x.dtype, x.device, opts)
             debug_log(f"mask_fn returned pr_mask_is_none={pr_mask is None}")
             if pr_mask is not None:
                 debug_log(f"pr_mask info: shape={list(pr_mask.shape)} min={pr_mask.min().item()} max={pr_mask.max().item()} sum={pr_mask.sum().item()}")
@@ -118,10 +130,11 @@ class _CrossAttnPatch:
         self.mask_fn = mask_fn
 
     def __get__(self, obj, objtype=None):
-        impl, mask_fn = self.impl, self.mask_fn
-
+        impl = self.impl
         def wrapped(self_module, *args, **kwargs):
-            return impl(self_module, mask_fn, *args, **kwargs)
+            transformer_options = kwargs.get("transformer_options", {})
+            active_mask_fn = transformer_options.get("promptrelay_mask_fn", self.mask_fn)
+            return impl(self_module, active_mask_fn, *args, **kwargs)
 
         return types.MethodType(wrapped, obj)
 

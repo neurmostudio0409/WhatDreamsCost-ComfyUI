@@ -12,6 +12,8 @@ import node_helpers
 from comfy_extras import nodes_lt
 from comfy_api.latest import io
 from .ltx_director import GuideData, MotionGuideData, _resize_image
+from .patches import get_current_node_id
+import weakref
 
 log = logging.getLogger(__name__)
 
@@ -95,7 +97,9 @@ def _snap_latent_to_downscale(latent_image, noise_mask, downscale_factor, method
     )
     return _resize_latent_spatial(latent_image, noise_mask, new_w, new_h, method)
 
-def _load_lora_model_only(model, ic_lora_name, strength_model):
+_LORA_MODEL_CACHE = weakref.WeakKeyDictionary()
+
+def _load_lora_model_only(model, ic_lora_name, strength_model, node_id):
     lora_path = folder_paths.get_full_path_or_raise("loras", ic_lora_name)
     lora, metadata = comfy.utils.load_torch_file(
         lora_path, safe_load=True, return_metadata=True,
@@ -113,9 +117,15 @@ def _load_lora_model_only(model, ic_lora_name, strength_model):
     if strength_model == 0:
         return model, latent_downscale_factor
 
+    model_cache = _LORA_MODEL_CACHE.setdefault(model, {})
+    cache_key = (ic_lora_name, strength_model, node_id)
+    if cache_key in model_cache:
+        return model_cache[cache_key], latent_downscale_factor
+
     model_lora, _ = comfy.sd.load_lora_for_models(
         model, None, lora, strength_model, 0,
     )
+    model_cache[cache_key] = model_lora
     return model_lora, latent_downscale_factor
 
 def _encode_video_iclora_guide(vae, latent_width, latent_height, images, scale_factors, latent_downscale_factor, crop, use_tiled_encode, tile_size, tile_overlap, resize_method="crop"):
@@ -213,6 +223,19 @@ class ResampleGuideFrames:
 
 def _load_motion_video_frames(video_file, trim_start_frames, length_frames, director_fps, resample_mode="nearest"):
     path = _resolve_input_video_path(video_file)
+    
+    # Check if the file is a static image rather than a video (e.g. reference sheets)
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+        from PIL import Image
+        log.info(f"[LTXDirectorGuide] Loading static reference image: {path} and repeating for {length_frames} frames")
+        img = Image.open(path).convert("RGB")
+        arr = np.array(img, dtype=np.float32) / 255.0
+        frame_tensor = torch.from_numpy(arr)  # Shape: [H, W, 3]
+        # Repeat frame_tensor length_frames times to get [length_frames, H, W, 3]
+        video_frames = frame_tensor.unsqueeze(0).repeat(length_frames, 1, 1, 1)
+        return video_frames
+
     target_fps = max(1.0, float(director_fps))
     start_s = max(0.0, float(trim_start_frames) / target_fps)
     dur_s = max(0.0, float(length_frames) / target_fps)
@@ -320,7 +343,8 @@ class LTXDirectorGuide:
 
         latent_downscale_factor = 1.0
         if model is not None and ic_lora_name != "None":
-            model, latent_downscale_factor = _load_lora_model_only(model, ic_lora_name, ic_lora_strength)
+            node_id = get_current_node_id()
+            model, latent_downscale_factor = _load_lora_model_only(model, ic_lora_name, ic_lora_strength, node_id)
 
         scale_factors = vae.downscale_index_formula
         latent_image = latent["samples"].clone()

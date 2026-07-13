@@ -1,6 +1,23 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+function hideWidget(w) {
+    if (!w) return;
+    w.hidden = true;
+    if (!w.options) w.options = {};
+    w.options.hidden = true;
+
+    if (!window.LiteGraph || !window.LiteGraph.vueNodesMode) {
+        w.computeSize = () => [0, -4];
+        if (!w._hiddenDrawHooked) {
+            w._origDraw = w.hasOwnProperty('draw') ? w.draw : undefined;
+            w._hiddenDrawHooked = true;
+        }
+        w.draw = () => { };
+    }
+    if (w.element) w.element.style.display = "none";
+}
+
 app.registerExtension({
     name: "Comfy.LoadAudioUI",
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
@@ -52,15 +69,7 @@ app.registerExtension({
                         const nativeWidgetIndex = node.widgets.findIndex(w => w.name === "audioUI");
                         if (nativeWidgetIndex !== -1) {
                             const w = node.widgets[nativeWidgetIndex];
-                            if (w.element) {
-                                w.element.style.display = "none";
-                                w.element.style.height = "0px";
-                                w.element.style.position = "absolute";
-                                w.element.style.pointerEvents = "none";
-                            }
-                            w.type = "hidden";
-                            w.hidden = true;
-                            w.computeSize = () => [0, 0];
+                            hideWidget(w);
                             
                             // Only update height to account for the hidden widget, 
                             // preserving the width (whether it's the default 475 or a user-saved value).
@@ -91,7 +100,6 @@ app.registerExtension({
                         const body = new FormData();
                         body.append("image", file);
                         body.append("type", "input");
-                        body.append("subfolder", "whatdreamscost");
                         
                         const resp = await api.fetchApi("/upload/image", {
                             method: "POST",
@@ -118,6 +126,14 @@ app.registerExtension({
                         console.error("Error uploading dragged audio file:", err);
                     }
                     return true;
+                };
+
+                this.onDragOver = function(e) {
+                    if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes("Files")) {
+                        e.preventDefault();
+                        return true;
+                    }
+                    return false;
                 };
 
                 this.onDragDrop = function(e) {

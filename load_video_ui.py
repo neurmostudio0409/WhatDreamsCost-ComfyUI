@@ -32,7 +32,7 @@ async def upload_chunk(request):
     chunk_index = int(post.get("chunk_index"))
     total_chunks = int(post.get("total_chunks"))
 
-    upload_dir = os.path.join(folder_paths.get_input_directory(), "whatdreamscost")
+    upload_dir = folder_paths.get_input_directory()
     os.makedirs(upload_dir, exist_ok=True)
     file_path = os.path.join(upload_dir, filename)
 
@@ -44,16 +44,33 @@ async def upload_chunk(request):
     await loop.run_in_executor(None, _read_and_write_file_chunk, file, file_path, mode)
 
     if chunk_index == total_chunks - 1:
-        return web.json_response({"name": f"whatdreamscost/{filename}"})
+        return web.json_response({"name": filename})
     return web.json_response({"status": "ok"})
 
 
 class LoadVideoUI:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
+        input_dir = folder_paths.get_input_directory()
+        files = []
+        if os.path.exists(input_dir):
+            all_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+            wdc_dir = os.path.join(input_dir, "whatdreamscost")
+            if os.path.exists(wdc_dir):
+                wdc_files = [f"whatdreamscost/{f}" for f in os.listdir(wdc_dir) if os.path.isfile(os.path.join(wdc_dir, f))]
+                all_files.extend(wdc_files)
+            try:
+                files = sorted(folder_paths.filter_files_content_types(all_files, ["video"]))
+            except:
+                video_extensions = ('.mp4', '.webm', '.mkv', '.avi', '.mov', '.m4v', '.flv', '.wmv')
+                files = sorted([f for f in all_files if f.lower().endswith(video_extensions)])
+
+        if not files or len(files) == 0:
+            files = ["none"]
+
         return {
             "required": {
-                "video": ("STRING", {"default": ""}),
+                "video": (files,),
                 "start_time": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01}),
                 "end_time": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01}),
                 "duration": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01}),
@@ -72,17 +89,21 @@ class LoadVideoUI:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT")
-    RETURN_NAMES = ("images", "audio", "duration", "frame_count")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT", "STRING")
+    RETURN_NAMES = ("images", "audio", "duration", "frame_count", "filename")
     FUNCTION = "load_video"
     CATEGORY = "WhatDreamsCost"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, video, **kwargs):
+        return True
 
     def load_video(self, video, frame_rate, display_mode, start_time, end_time, duration, start_frame, end_frame, duration_frames, custom_width=0, custom_height=0, resize_method="maintain aspect ratio", crop_x=0.0, crop_y=0.0, crop_w=1.0, crop_h=1.0, **kwargs):
         if not video:
             # Return blank defaults if no video is loaded
             empty_image = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
             empty_audio = {"waveform": torch.zeros((1, 1, 44100)), "sample_rate": 44100}
-            return (empty_image, empty_audio, 0.0, 0)
+            return (empty_image, empty_audio, 0.0, 0, "")
 
         # 1. Resolve path using ComfyUI standard paths or Absolute Path
         video_path = video  # Try exact/absolute path first
@@ -420,4 +441,4 @@ class LoadVideoUI:
              calc_fr = float(frame_rate) if frame_rate > 0 else 24.0
              frame_count = int(np.floor(final_duration_sec * calc_fr))
 
-        return (image_tensor, audio_dict, final_duration_sec, frame_count)
+        return (image_tensor, audio_dict, final_duration_sec, frame_count, os.path.basename(video))

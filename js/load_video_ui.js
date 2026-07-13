@@ -1,6 +1,42 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+function hideWidget(w) {
+    if (!w) return;
+    w.hidden = true;
+    if (!w.options) w.options = {};
+    w.options.hidden = true;
+
+    if (!window.LiteGraph || !window.LiteGraph.vueNodesMode) {
+        w.computeSize = () => [0, -4];
+        if (!w._hiddenDrawHooked) {
+            w._origDraw = w.hasOwnProperty('draw') ? w.draw : undefined;
+            w._hiddenDrawHooked = true;
+        }
+        w.draw = () => { };
+    }
+    if (w.element) w.element.style.display = "none";
+}
+
+function showWidget(w) {
+    if (!w) return;
+    w.hidden = false;
+    if (w.options) w.options.hidden = false;
+
+    if (!window.LiteGraph || !window.LiteGraph.vueNodesMode) {
+        delete w.computeSize;
+        if (w._hiddenDrawHooked) {
+            if (w._origDraw !== undefined) {
+                w.draw = w._origDraw;
+            } else {
+                delete w.draw;
+            }
+            delete w._hiddenDrawHooked;
+        }
+    }
+    if (w.element) w.element.style.display = "";
+}
+
 app.registerExtension({
     name: "Comfy.LoadVideoUI",
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
@@ -82,6 +118,16 @@ app.registerExtension({
                 const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
                 const node = this;
 
+                node._initializing = true;
+                node._should_reset_trim = false;
+
+                // --- THE CORE FIX FOR COMFYUI V2 ---
+                Object.defineProperty(node, 'imgs', {
+                    get: function() { return undefined; },
+                    set: function(val) { /* Ignore attempts by ComfyUI to set an image preview */ },
+                    configurable: true
+                });
+
                 // Find the core widgets
                 const videoWidget = this.widgets.find((w) => w.name === "video");
                 const frameRateWidget = this.widgets.find((w) => w.name === "frame_rate");
@@ -105,32 +151,33 @@ app.registerExtension({
                 // ====================================================================
                 let isSyncing = false;
 
-                function setWidgetVisibility(w, visible, typeStr) {
-                    if (!w) return;
-                    w.hidden = !visible;
-                    if (!visible) {
-                        w.type = "hidden";
-                        w.computeSize = () => [0, -4]; // Suppresses gap allocation in V1
-                    } else {
-                        w.type = typeStr;
-                        delete w.computeSize; // Restores standard ComfyUI measurement
-                    }
-                }
-
                 node.toggleWidgetVisibility = function () {
                     const isFrames = displayModeWidget && displayModeWidget.value === "frames";
-                    setWidgetVisibility(startTimeWidget, !isFrames, "FLOAT");
-                    setWidgetVisibility(endTimeWidget, !isFrames, "FLOAT");
-                    setWidgetVisibility(durationWidget, !isFrames, "FLOAT");
-                    setWidgetVisibility(startFrameWidget, isFrames, "INT");
-                    setWidgetVisibility(endFrameWidget, isFrames, "INT");
-                    setWidgetVisibility(durationFramesWidget, isFrames, "INT");
-                    setWidgetVisibility(displayModeWidget, false, "combo"); // Toggle is hidden, driven by UI
+                    if (isFrames) {
+                        hideWidget(startTimeWidget);
+                        hideWidget(endTimeWidget);
+                        hideWidget(durationWidget);
+                        showWidget(startFrameWidget);
+                        showWidget(endFrameWidget);
+                        showWidget(durationFramesWidget);
+                    } else {
+                        showWidget(startTimeWidget);
+                        showWidget(endTimeWidget);
+                        showWidget(durationWidget);
+                        hideWidget(startFrameWidget);
+                        hideWidget(endFrameWidget);
+                        hideWidget(durationFramesWidget);
+                    }
+                    hideWidget(displayModeWidget); // driven by UI
 
-                    setWidgetVisibility(cropXWidget, false, "FLOAT");
-                    setWidgetVisibility(cropYWidget, false, "FLOAT");
-                    setWidgetVisibility(cropWWidget, false, "FLOAT");
-                    setWidgetVisibility(cropHWidget, false, "FLOAT");
+                    hideWidget(cropXWidget);
+                    hideWidget(cropYWidget);
+                    hideWidget(cropWWidget);
+                    hideWidget(cropHWidget);
+
+                    if (app.graph) {
+                        app.graph.setDirtyCanvas(true, true);
+                    }
 
                     // Allow the node to calculate its required min size, but DO NOT overwrite
                     // the current user-defined width/height unless it's strictly smaller than the minimum.
@@ -204,6 +251,9 @@ app.registerExtension({
                     const originalCallback = videoWidget.callback;
                     videoWidget.callback = function () {
                         if (originalCallback) originalCallback.apply(this, arguments);
+                        if (!node._initializing) {
+                            node._should_reset_trim = true;
+                        }
                         if (node.updatePreview) node.updatePreview(this.value);
                     };
                 }
@@ -232,10 +282,12 @@ app.registerExtension({
 
                         // Fast Path: If desktop environment exposes absolute file path, skip upload entirely!
                         if (file.path) {
+                            if (videoWidget.options && videoWidget.options.values && !videoWidget.options.values.includes(file.path)) {
+                                videoWidget.options.values.push(file.path);
+                            }
                             videoWidget.value = file.path;
+                            node._should_reset_trim = true;
                             node.updatePreview(file.path);
-                            if (startTimeWidget) startTimeWidget.value = 0;
-                            if (endTimeWidget) endTimeWidget.value = 0;
                             node.syncFramesFromTime();
                             return;
                         }
@@ -248,10 +300,12 @@ app.registerExtension({
                                 const checkResult = await checkResp.json();
                                 if (checkResult.exists) {
                                     console.log(`[LoadVideoUI] File already exists: ${checkResult.name}. Reusing existing file.`);
+                                    if (videoWidget.options && videoWidget.options.values && !videoWidget.options.values.includes(checkResult.name)) {
+                                        videoWidget.options.values.push(checkResult.name);
+                                    }
                                     videoWidget.value = checkResult.name;
+                                    node._should_reset_trim = true;
                                     node.updatePreview(checkResult.name);
-                                    if (startTimeWidget) startTimeWidget.value = 0;
-                                    if (endTimeWidget) endTimeWidget.value = 0;
                                     node.syncFramesFromTime();
                                     return;
                                 }
@@ -293,10 +347,12 @@ app.registerExtension({
 
                                 if (i === totalChunks - 1) {
                                     const data = await resp.json();
+                                    if (videoWidget.options && videoWidget.options.values && !videoWidget.options.values.includes(data.name)) {
+                                        videoWidget.options.values.push(data.name);
+                                    }
                                     videoWidget.value = data.name;
+                                    node._should_reset_trim = true;
                                     node.updatePreview(data.name);
-                                    if (startTimeWidget) startTimeWidget.value = 0;
-                                    if (endTimeWidget) endTimeWidget.value = 0;
                                     node.syncFramesFromTime();
                                 }
                             }
@@ -304,11 +360,11 @@ app.registerExtension({
                             // Standard upload for small files
                             const body = new FormData();
                             body.append("image", file);
-                            body.append("subfolder", "whatdreamscost");
 
                             const resp = await api.fetchApi("/upload/image", {
                                 method: "POST",
                                 body: body,
+                              // No subfolder param -> goes to input root!
                             });
 
                             if (resp.status === 413) {
@@ -317,10 +373,12 @@ app.registerExtension({
 
                             if (resp.status === 200) {
                                 const data = await resp.json();
+                                if (videoWidget.options && videoWidget.options.values && !videoWidget.options.values.includes(data.name)) {
+                                    videoWidget.options.values.push(data.name);
+                                }
                                 videoWidget.value = data.name;
+                                node._should_reset_trim = true;
                                 node.updatePreview(data.name);
-                                if (startTimeWidget) startTimeWidget.value = 0;
-                                if (endTimeWidget) endTimeWidget.value = 0;
                                 node.syncFramesFromTime();
                             } else {
                                 throw new Error(`Upload failed: ${resp.statusText}`);
@@ -346,6 +404,25 @@ app.registerExtension({
                 });
 
                 // Attach drag & drop directly onto the LiteGraph node canvas frame
+                node.onDragOver = function (e) {
+                    if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes("Files")) {
+                        e.preventDefault();
+                        return true;
+                    }
+                    return false;
+                };
+
+                node.onDragDrop = function (e) {
+                    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                        const file = e.dataTransfer.files[0];
+                        if (file.type.startsWith('video/') || file.name.toLowerCase().match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/)) {
+                            uploadFile(file);
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+
                 node.onDropFile = function (file) {
                     // Check MIME type or common video file extensions to ensure all videos are caught
                     if (file.type.startsWith('video/') || file.name.toLowerCase().match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/)) {
@@ -1404,9 +1481,16 @@ app.registerExtension({
 
                 videoPreview.onloadedmetadata = () => {
                     duration = videoPreview.duration;
-                    if (endTimeWidget && (endTimeWidget.value === 0 || endTimeWidget.value > duration)) {
-                        endTimeWidget.value = duration;
+                    if (node._should_reset_trim) {
+                        if (startTimeWidget) startTimeWidget.value = 0;
+                        if (endTimeWidget) endTimeWidget.value = duration;
+                        node._should_reset_trim = false;
                         node.syncFramesFromTime();
+                    } else {
+                        if (endTimeWidget && (endTimeWidget.value === 0 || endTimeWidget.value > duration)) {
+                            endTimeWidget.value = duration;
+                            node.syncFramesFromTime();
+                        }
                     }
                     updateRuler();
                     updateUI();
@@ -1546,6 +1630,8 @@ app.registerExtension({
                 if (videoWidget && videoWidget.value) {
                     node.updatePreview(videoWidget.value);
                 }
+
+                setTimeout(() => { node._initializing = false; }, 500);
 
                 return r;
             };
