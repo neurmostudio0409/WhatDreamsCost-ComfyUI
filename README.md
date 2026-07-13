@@ -42,24 +42,24 @@ Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest 
 
 **v2.0.4**
   * **LTX Director**
-    - **Reference Image Support:** Now supports the LTX Ingredients IC-LoRA, and adding images on the IC-LoRA track. If your wondering why I chose the ingredient IC-LoRA over other methods, it's simply because i've found it to be the most stable and consistent solution after trying the others (such as MSR and BFS). I will be sharing my findings soon on how to make the most use of it.
+    - **Reference Image Support:** Now supports the LTX Ingredients IC-LoRA, and adding images on the IC-LoRA track. If you're wondering why I chose the ingredient IC-LoRA over other methods, it's simply because i've found it to be the most stable and consistent solution after trying the others (such as MSR and BFS). I will be sharing my findings soon on how to make the most use of it.
     - **Multiple Optimizations (potential 1.5-3x speed up (yes the range is that big) depending on your hardware/what parameters you are using):** 
-    1. Model Caching: Allows subsequent runs to reuse patched models. This not only prevents the model from needing to be reloaded every run (which can be a huge speed up in itself), but also optimizes CPU overhead.
-    2. Faster generations that don't use Prompt Relay: Normal t2v/i2v/v2v generations will no longer use prompt relay. Now generations that don't use promtp relay will run at the same speed as other workflows
+    1. Model Caching: Allows subsequent runs to reuse patched models. This not only prevents the model from needing to be reloaded every run (which can be a huge speed-up in itself), but also optimizes CPU overhead.
+    2. Faster generations that don't use Prompt Relay: Normal t2v/i2v/v2v generations will no longer use prompt relay. Now generations that don't use prompt relay will run at the same speed as other workflows
     3. Improved SageAttention / Triton compatibility.
     4. Multiple Video Loading optimizations
     - **Quality of Life changes**
-    1. Added multiple options to the right click menu for IC-LoRA segments
-    2. Smoother Timeline Scrubbing: Seeking through video now show much thumbnails (basically meaning you can more accurately trim/edit videos on the timeline)
+    1. Added multiple options to the right-click menu for IC-LoRA segments
+    2. Smoother Timeline Scrubbing: Seeking through video now shows more thumbnails (basically meaning you can more accurately trim/edit videos on the timeline)
   * **Load Video UI** 
-    - Fixed drag and dropping videos onto node
+    - Fixed drag and dropping files onto the node
     - Added dropdown for selecting files
-    - Added support for scanning both input and whatdreamscost workspace folder for videos
+    - Added support for scanning both the input and whatdreamscost workspace folder for videos
     - Added full Nodes 2.0 Support (now renders properly in both litegraph and 2.0)
     - Added filename output (heavily requested)
 * **Load Audio UI** 
-    - Fixed drag and dropping videos onto node
-    - Added support for scanning both input and whatdreamscost workspace folder for audio
+    - Fixed drag and dropping files onto the node
+    - Added support for scanning both the input and whatdreamscost workspace folder for audio
     - Added full Nodes 2.0 Support (now renders properly in both litegraph and 2.0)
     - Added filename output (heavily requested)
     
